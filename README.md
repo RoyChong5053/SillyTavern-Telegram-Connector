@@ -1,5 +1,5 @@
 # SillyTavern Telegram Connector
-
+Original Project: https://github.com/qiqi20020612/SillyTavern-Telegram-Connector
 SillyTavern Telegram Connector 是一个为 SillyTavern 设计的扩展，允许用户通过 Telegram 与 SillyTavern 中的 AI 角色进行交互。该扩展建立了 SillyTavern 与 Telegram 机器人之间的桥接，使用户能够在移动设备上随时随地与他们喜爱的 AI 角色聊天。
 
 [![License](https://img.shields.io/github/license/RoyChong5053/SillyTavern-Telegram-Connector)](https://github.com/RoyChong5053/SillyTavern-Telegram-Connector/blob/main/LICENSE)
