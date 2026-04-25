@@ -31,6 +31,9 @@ const DEFAULT_SETTINGS = {
 
 let ws = null; // WebSocket实例
 let lastProcessedChatId = null; // 用于存储最后处理过的Telegram chatId
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY_MS = 3000;
 
 // 添加一个全局变量来跟踪当前是否处于流式模式
 let isStreamingMode = false;
@@ -77,6 +80,7 @@ function connect() {
     ws.onopen = () => {
         console.log('[Telegram Bridge] 连接成功！');
         updateStatus('已连接', 'green');
+        reconnectAttempts = 0;
     };
 
     ws.onmessage = async (event) => {
@@ -101,6 +105,29 @@ function connect() {
 
                 // 2. 将用户消息添加到SillyTavern
                 await sendMessageAsUser(data.text);
+
+                // 2.5 如果有inline image，将其添加到最新消息的extra.media中
+                if (data.inlineImage) {
+                    console.log('[Telegram Bridge] 收到inline image，正在附加到消息...');
+                    const context = SillyTavern.getContext();
+                    const lastMsg = context.chat[context.chat.length - 1];
+                    if (lastMsg && lastMsg.is_user) {
+                        if (!lastMsg.extra) lastMsg.extra = {};
+                        if (!Array.isArray(lastMsg.extra.media)) lastMsg.extra.media = [];
+                        lastMsg.extra.media.push({
+                            url: data.inlineImage,
+                            type: 'image',
+                            title: 'Telegram Image',
+                            source: 'api',
+                        });
+                        lastMsg.extra.inline_image = true;
+                        // 保存聊天
+                        if (context.saveChatConditional) {
+                            await context.saveChatConditional();
+                        }
+                        console.log('[Telegram Bridge] Inline image已附加到消息。');
+                    }
+                }
 
                 // 3. 设置流式传输的回调
                 const streamCallback = (cumulativeText) => {
@@ -136,19 +163,91 @@ function connect() {
                 eventSource.once(event_types.GENERATION_STOPPED, cleanup);
 
                 // 6. 触发SillyTavern的生成流程，并用try...catch包裹
-                try {
-                    const abortController = new AbortController();
-                    setExternalAbortController(abortController);
-                    await Generate('normal', { signal: abortController.signal });
-                } catch (error) {
-                    console.error("[Telegram Bridge] Generate() 错误:", error);
+                // 修改为基于时间的重试机制，最长5分钟
+                const MAX_RETRY_TIME_MS = 5 * 60 * 1000; // 5分钟
+                const INITIAL_DELAY_MS = 3000; // 初始延迟3秒
+                const MAX_DELAY_MS = 30000; // 最大延迟30秒
+                let generationSuccess = false;
+                let lastError = null;
+                let retryCount = 0;
+                const startTime = Date.now();
 
-                    // a. 从SillyTavern聊天记录中删除导致错误的用户消息
+                while (!generationSuccess && (Date.now() - startTime) < MAX_RETRY_TIME_MS) {
+                    try {
+                        if (retryCount > 0) {
+                            // 计算指数退避延迟（带随机抖动）
+                            const delay = Math.min(
+                                INITIAL_DELAY_MS * Math.pow(2, retryCount - 1) + Math.random() * 1000,
+                                MAX_DELAY_MS
+                            );
+                            console.log(`[Telegram Bridge] AI生成重试 (${retryCount}), 等待 ${Math.round(delay)}ms... (已用时: ${Math.round((Date.now() - startTime) / 1000)}s)`);
+
+                            // 向Telegram发送重试状态
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: 'retry_status',
+                                    chatId: data.chatId,
+                                    retryCount: retryCount,
+                                    elapsedTime: Math.round((Date.now() - startTime) / 1000),
+                                }));
+                            }
+
+                            await new Promise(r => setTimeout(r, delay));
+                        }
+
+                        const abortController = new AbortController();
+                        setExternalAbortController(abortController);
+                        await Generate('normal', { signal: abortController.signal });
+                        generationSuccess = true;
+                    } catch (error) {
+                        lastError = error;
+                        const errorMsg = error.message || '';
+
+                        console.log(`[Telegram Bridge] Generate错误: ${errorMsg}`);
+
+                        // 只对 500 错误进行重试
+                        if (errorMsg.includes('500') || errorMsg.includes('Internal Server Error') || errorMsg.includes('response status 500')) {
+                            console.log(`[Telegram Bridge] 检测到500错误，准备重试...`);
+                            retryCount++;
+
+                            // 检查是否超过最大重试时间
+                            if ((Date.now() - startTime) >= MAX_RETRY_TIME_MS) {
+                                console.log(`[Telegram Bridge] 已达到最大重试时间 ${MAX_RETRY_TIME_MS / 1000}秒`);
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // 非500错误: 立即失败
+                        console.error("[Telegram Bridge] Generate() 非500错误:", error);
+                        await deleteLastMessage();
+                        console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
+
+                        const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'error_message',
+                                chatId: data.chatId,
+                                text: errorMessage,
+                            }));
+                        }
+
+                        data.error = true;
+                        cleanup();
+                        return; // 非500错误直接返回，不继续重试
+                    }
+                }
+
+                // 所有重试都失败（超时或达到最大重试时间）
+                if (!generationSuccess && lastError) {
+                    console.error("[Telegram Bridge] 所有重试都失败:", lastError);
+
+                    // 删除SillyTavern中残留的用户消息
                     await deleteLastMessage();
-                    console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
+                    console.log('[Telegram Bridge] 已删除重试失败的用户消息。');
 
-                    // b. 准备并发送错误信息到服务端
-                    const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
+                    const elapsedTime = Math.round((Date.now() - startTime) / 1000);
+                    const errorMessage = `抱歉，AI生成回复超时（${elapsedTime}秒）。\n您的上一条消息已被撤回，请稍后重试。\n\n错误详情: ${lastError.message || '请求超时'}`;
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({
                             type: 'error_message',
@@ -156,10 +255,8 @@ function connect() {
                             text: errorMessage,
                         }));
                     }
-
-                    // c. 标记错误以便cleanup函数知道
                     data.error = true;
-                    cleanup(); // 确保清理监听器
+                    cleanup();
                 }
 
                 return;
@@ -343,19 +440,27 @@ function connect() {
 
     ws.onclose = () => {
         console.log('[Telegram Bridge] 连接已关闭。');
-        updateStatus('连接已断开', 'red');
         ws = null;
+        updateStatus('已断开', 'red');
+
+        const settings = getSettings();
+        if (settings.autoConnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            reconnectAttempts++;
+            console.log(`[Telegram Bridge] 尝试重新连接 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+            setTimeout(connect, RECONNECT_DELAY_MS);
+        } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            updateStatus('重连失败，请检查服务器', 'red');
+        }
     };
 
     ws.onerror = (error) => {
-        console.error('[Telegram Bridge] WebSocket 错误：', error);
-        updateStatus('连接错误', 'red');
-        ws = null;
+        console.error('[Telegram Bridge] WebSocket错误:', error);
     };
 }
 
 function disconnect() {
     if (ws) {
+        reconnectAttempts = MAX_RECONNECT_ATTEMPTS;
         ws.close();
     }
 }

@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 // 添加日志记录函数，带有时间戳
 function logWithTimestamp(level, ...args) {
@@ -181,6 +182,9 @@ let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
 // 用于存储正在进行的流式会话，调整会话结构，使用Promise来处理messageId
 // 结构: { messagePromise: Promise<number> | null, lastText: String, timer: NodeJS.Timeout | null, isEditing: boolean }
 const ongoingStreams = new Map();
+
+// 用于存储每个聊天最后一条消息的文本，以便重发
+const lastMessages = new Map();
 
 // 重载服务器函数
 function reloadServer(chatId) {
@@ -652,7 +656,20 @@ wss.on('connection', ws => {
             // --- 其他消息处理逻辑 ---
             if (data.type === 'error_message' && data.chatId) {
                 logWithTimestamp('error', `收到SillyTavern的错误报告，将发送至Telegram用户 ${data.chatId}: ${data.text}`);
-                bot.sendMessage(data.chatId, data.text);
+                // 发送错误消息，并附带"重发"按钮
+                bot.sendMessage(data.chatId, data.text, {
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: '🔄 重发消息', callback_data: `resend_${data.chatId}` }
+                        ]]
+                    }
+                }).catch(err => {
+                    logWithTimestamp('error', '发送错误消息失败:', err.message);
+                });
+            } else if (data.type === 'retry_status' && data.chatId) {
+                // 发送重试状态更新（可以编辑之前的状态消息，或发送新消息）
+                logWithTimestamp('log', `重试状态: 第${data.retryCount}次重试，已用时${data.elapsedTime}秒`);
+                // 可选：可以发送状态消息，但为避免刷屏，这里只记录日志
             } else if (data.type === 'ai_reply' && data.chatId) {
                 logWithTimestamp('log', `收到非流式AI回复，发送至Telegram用户 ${data.chatId}`);
                 // 确保在发送消息前清理可能存在的流式会话
@@ -707,7 +724,90 @@ wss.on('connection', ws => {
     });
 });
 
-// 检查是否需要发送重启完成通知
+// 下载图片并转换为base64 inline data URI
+function downloadPhoto(fileId) {
+    return new Promise((resolve, reject) => {
+        bot.getFileLink(fileId).then(fileUrl => {
+            const url = new URL(fileUrl);
+            const options = {
+                hostname: url.hostname,
+                path: url.pathname + url.search,
+                method: 'GET',
+            };
+
+            const chunks = [];
+            https.get(options, (res) => {
+                res.on('data', chunk => chunks.push(chunk));
+                res.on('end', () => {
+                    const buffer = Buffer.concat(chunks);
+                    resolve(buffer);
+                });
+            }).on('error', reject);
+        }).catch(reject);
+    });
+}
+
+// 处理图片消息
+async function handlePhotoMessage(msg, chatId) {
+    try {
+        logWithTimestamp('log', `从Telegram用户 ${chatId} 收到图片消息`);
+
+        // 获取最高分辨率的图片file_id
+        const photos = msg.photo;
+        const fileId = photos[photos.length - 1].file_id;
+
+        // 获取图片文件URL
+        const fileLink = await bot.getFileLink(fileId);
+        logWithTimestamp('log', `图片文件URL: ${fileLink}`);
+
+        // 下载图片
+        const buffer = await downloadPhoto(fileId);
+
+        // 转换为base64 inline data URI (SillyTavern inline image format)
+        const base64 = buffer.toString('base64');
+
+        // 尝试检测MIME类型（默认jpeg）
+        let mimeType = 'image/jpeg';
+        if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+            mimeType = 'image/png';
+        } else if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+            mimeType = 'image/gif';
+        } else if (buffer[0] === 0x57 && buffer[1] === 0x45 && buffer[2] === 0x42 && buffer[3] === 0x50) {
+            mimeType = 'image/webp';
+        }
+
+        const inlineImageUri = `data:${mimeType};base64,${base64}`;
+
+        // 获取图片的caption（如果有的话）
+        const caption = msg.caption || '';
+
+        // 显示"输入中"状态
+        bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+        // 将图片作为inline image发送给SillyTavern
+        // 通过extra字段传递inlineImage数据URI，由前端添加到消息的extra.media中
+        if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
+            logWithTimestamp('log', `向SillyTavern发送inline image消息`);
+            const payload = JSON.stringify({
+                type: 'user_message',
+                chatId,
+                text: caption,
+                inlineImage: inlineImageUri,
+            });
+            sillyTavernClient.send(payload);
+        } else {
+            logWithTimestamp('warn', '收到Telegram图片，但SillyTavern扩展未连接。');
+            bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+        }
+    } catch (error) {
+        logWithTimestamp('error', '处理图片消息时出错:', error);
+        bot.sendMessage(chatId, '处理图片时出错，请稍后重试。').catch(err => {
+            logWithTimestamp('error', '发送错误消息失败:', err.message);
+        });
+    }
+}
+
+
 if (process.env.RESTART_NOTIFY_CHATID) {
     const chatId = parseInt(process.env.RESTART_NOTIFY_CHATID);
     if (!isNaN(chatId)) {
@@ -722,7 +822,7 @@ if (process.env.RESTART_NOTIFY_CHATID) {
 }
 
 // 监听Telegram消息
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
     const userId = msg.from.id;
@@ -740,6 +840,18 @@ bot.on('message', (msg) => {
             // 终止后续处理
             return;
         }
+    }
+
+    // 处理图片消息
+    if (msg.photo) {
+        await handlePhotoMessage(msg, chatId);
+        return;
+    }
+
+    // 处理图片文档（以文件形式发送的图片）
+    if (msg.document && (msg.document.mime_type || '').startsWith('image/')) {
+        await handlePhotoMessage(msg, chatId);
+        return;
     }
 
     if (!text) return;
@@ -763,10 +875,58 @@ bot.on('message', (msg) => {
     // 处理普通消息
     if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
         logWithTimestamp('log', `从Telegram用户 ${chatId} 收到消息: "${text}"`);
+        // 存储消息文本以便重发
+        lastMessages.set(chatId, text);
         const payload = JSON.stringify({ type: 'user_message', chatId, text });
         sillyTavernClient.send(payload);
     } else {
         logWithTimestamp('warn', '收到Telegram消息，但SillyTavern扩展未连接。');
         bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+    }
+});
+
+// 处理回调查询（如重发按钮点击）
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data;
+
+    // 确认回调查询，移除按钮的loading状态
+    bot.answerCallbackQuery(query.id).catch(err => {
+        logWithTimestamp('error', '回答回调查询失败:', err.message);
+    });
+
+    if (data.startsWith('resend_')) {
+        const callbackChatId = parseInt(data.split('_')[1]);
+
+        // 验证chatId是否匹配
+        if (callbackChatId !== chatId) {
+            logWithTimestamp('warn', `回调chatId ${callbackChatId} 与消息chatId ${chatId} 不匹配`);
+            return;
+        }
+
+        // 获取存储的消息文本
+        const lastText = lastMessages.get(chatId);
+        if (!lastText) {
+            logWithTimestamp('warn', `没有找到chatId ${chatId} 的消息文本用于重发`);
+            bot.sendMessage(chatId, '无法重发：未找到原始消息内容。请重新发送。').catch(err => {
+                logWithTimestamp('error', '发送错误消息失败:', err.message);
+            });
+            return;
+        }
+
+        logWithTimestamp('log', `用户请求重发消息到 chatId ${chatId}: "${lastText}"`);
+
+        // 检查SillyTavern是否连接
+        if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
+            bot.sendMessage(chatId, 'SillyTavern未连接，无法重发消息。').catch(err => {
+                logWithTimestamp('error', '发送错误消息失败:', err.message);
+            });
+            return;
+        }
+
+        // 重新发送消息到SillyTavern
+        const payload = JSON.stringify({ type: 'user_message', chatId, text: lastText });
+        sillyTavernClient.send(payload);
+        logWithTimestamp('log', `已重发消息到SillyTavern: "${lastText}"`);
     }
 });

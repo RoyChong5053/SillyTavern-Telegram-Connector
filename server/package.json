@@ -11,7 +11,7 @@
   "license": "GPL-3.0",
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
-    "ws": "^8.14.2"
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
