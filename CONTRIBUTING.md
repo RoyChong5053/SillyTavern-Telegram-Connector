@@ -43,7 +43,7 @@
 
 1. 克隆仓库：
    ```bash
-   git clone https://github.com/qiqi20020612/SillyTavern-Telegram-Connector.git
+   git clone https://github.com/RoyChong5053/SillyTavern-Telegram-Connector.git
    cd SillyTavern-Telegram-Connector
    ```
 

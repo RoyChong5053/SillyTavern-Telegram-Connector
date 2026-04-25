@@ -526,132 +526,204 @@ wss.on('connection', ws => {
         try {
             data = JSON.parse(message);
 
-            // --- 处理流式文本块 ---
-            if (data.type === 'stream_chunk' && data.chatId) {
-                let session = ongoingStreams.get(data.chatId);
+// --- 处理流式文本块 ---
+if (data.type === 'stream_chunk' && data.chatId) {
+  let session = ongoingStreams.get(data.chatId);
 
-                // 1. 如果会话不存在，立即同步创建一个占位会话，创建会话和messagePromise
-                if (!session) {
-                    // 使用let声明，以便在Promise内部访问
-                    let resolveMessagePromise;
-                    const messagePromise = new Promise(resolve => {
-                        resolveMessagePromise = resolve;
-                    });
+  // 1. 如果会话不存在，立即同步创建一个占位会话，创建会话和 messagePromise
+  if (!session) {
+    // 使用 let 声明，以便在 Promise 内部访问 resolve 和 reject
+    let resolveMessagePromise, rejectMessagePromise;
+    const messagePromise = new Promise((resolve, reject) => {
+      resolveMessagePromise = resolve;
+      rejectMessagePromise = reject;
+    });
 
-                    session = {
-                        messagePromise: messagePromise,
-                        lastText: data.text,
-                        timer: null,
-                        isEditing: false, // 新增状态锁
-                    };
-                    ongoingStreams.set(data.chatId, session);
+    // 设置会话超时清理（60 秒）
+    const SESSION_TIMEOUT_MS = 60000;
+    const timeoutId = setTimeout(() => {
+      logWithTimestamp('warn', `流式会话超时，清理 ChatID ${data.chatId}`);
+      if (rejectMessagePromise) {
+        rejectMessagePromise(new Error('Session timeout'));
+      }
+      if (ongoingStreams.has(data.chatId)) {
+        const s = ongoingStreams.get(data.chatId);
+        if (s.timer) clearTimeout(s.timer);
+        if (s.timeoutId) clearTimeout(s.timeoutId);
+        ongoingStreams.delete(data.chatId);
+      }
+      bot.sendMessage(data.chatId, '生成超时，请稍后重试。').catch(() => {});
+    }, SESSION_TIMEOUT_MS);
 
-                    // 异步发送第一条消息并更新 session
-                    bot.sendMessage(data.chatId, '正在思考...')
-                        .then(sentMessage => {
-                            // 当消息发送成功时，解析Promise并传入messageId
-                            resolveMessagePromise(sentMessage.message_id);
-                        }).catch(err => {
-                            logWithTimestamp('error', '发送初始Telegram消息失败:', err);
-                            ongoingStreams.delete(data.chatId); // 出错时清理
-                        });
-                } else {
-                    // 2. 如果会话存在，只更新最新文本
-                    session.lastText = data.text;
-                }
+    session = {
+      messagePromise: messagePromise,
+      rejectPromise: rejectMessagePromise,  // 保存 reject 函数用于错误清理
+      lastText: data.text,
+      timer: null,
+      isEditing: false,
+      timeoutId: timeoutId,  // 保存超时 ID 用于清理
+    };
+    ongoingStreams.set(data.chatId, session);
 
-                // 3. 尝试触发一次编辑（节流保护）
-                // 确保 messageId 已经获取到，并且当前没有正在进行的编辑或定时器
-                // 使用 await messagePromise 来确保messageId可用
-                const messageId = await session.messagePromise;
+    // 异步发送第一条消息并更新 session
+    bot.sendMessage(data.chatId, '正在思考...')
+      .then(sentMessage => {
+        // 当消息发送成功时，解析 Promise 并传入 messageId
+        resolveMessagePromise(sentMessage.message_id);
+      })
+      .catch(err => {
+        logWithTimestamp('error', '发送初始 Telegram 消息失败:', err);
+        // 主动 reject Promise，防止挂起
+        if (rejectMessagePromise) {
+          rejectMessagePromise(err);
+        }
+        // 清理超时定时器
+        if (timeoutId) clearTimeout(timeoutId);
+        ongoingStreams.delete(data.chatId);
+      });
+  } else {
+    // 2. 如果会话存在，只更新最新文本
+    session.lastText = data.text;
+  }
 
-                if (messageId && !session.isEditing && !session.timer) {
-                    session.timer = setTimeout(async () => { // 定时器回调也设为async
-                        const currentSession = ongoingStreams.get(data.chatId);
-                        if (currentSession) {
-                            const currentMessageId = await currentSession.messagePromise;
-                            if (currentMessageId) {
-                                currentSession.isEditing = true;
-                                bot.editMessageText(currentSession.lastText + ' ...', {
-                                    chat_id: data.chatId,
-                                    message_id: currentMessageId,
-                                }).catch(err => {
-                                    if (!err.message.includes('message is not modified'))
-                                        logWithTimestamp('error', '编辑Telegram消息失败:', err.message);
-                                }).finally(() => {
-                                    if (ongoingStreams.has(data.chatId)) ongoingStreams.get(data.chatId).isEditing = false;
-                                });
-                            }
-                            currentSession.timer = null;
-                        }
-                    }, 2000);
-                }
-                return;
+  // 3. 尝试触发一次编辑（节流保护）
+  // 确保 messageId 已经获取到，并且当前没有正在进行的编辑或定时器
+  // 使用 await messagePromise 来确保 messageId 可用
+  let messageId;
+  try {
+    messageId = await session.messagePromise;
+  } catch (err) {
+    logWithTimestamp('error', '获取 messageId 失败:', err);
+    return;  // Promise 被 reject，直接返回
+  }
+
+  // 每次收到 chunk 时重置定时器
+  if (session.timer) {
+    clearTimeout(session.timer);
+  }
+
+  if (messageId && !session.isEditing) {
+    session.timer = setTimeout(async () => { // 定时器回调也设为 async
+      const currentSession = ongoingStreams.get(data.chatId);
+      if (currentSession) {
+        // 再次获取 messageId，确保仍然有效
+        let currentMessageId;
+        try {
+          currentMessageId = await currentSession.messagePromise;
+        } catch (err) {
+          logWithTimestamp('error', '获取 messageId 失败:', err);
+          if (currentSession.timer) {
+            currentSession.timer = null;
+          }
+          return;
+        }
+        
+        if (currentMessageId) {
+          currentSession.isEditing = true;
+          bot.editMessageText(currentSession.lastText + ' ...', {
+            chat_id: data.chatId,
+            message_id: currentMessageId,
+          }).catch(err => {
+            if (!err.message.includes('message is not modified'))
+              logWithTimestamp('error', '编辑 Telegram 消息失败:', err.message);
+          }).finally(() => {
+            if (ongoingStreams.has(data.chatId)) {
+              ongoingStreams.get(data.chatId).isEditing = false;
             }
+          });
+        }
+        currentSession.timer = null;
+      }
+    }, 2000);
+  }
+  return;
+}
 
-            // --- 处理流式结束信号 ---
-            if (data.type === 'stream_end' && data.chatId) {
-                const session = ongoingStreams.get(data.chatId);
-                // 只有当存在会话时才处理，这表明确实是流式传输
-                if (session) {
-                    if (session.timer) {
-                        clearTimeout(session.timer);
-                    }
-                    logWithTimestamp('log', `收到流式结束信号，等待最终渲染文本更新...`);
-                    // 注意：我们不在这里清理会话，而是等待final_message_update
-                }
-                // 如果不存在会话但收到stream_end，这是一个异常情况
-                // 可能是由于某些原因会话被提前清理了
-                else {
-                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
-                    // 为安全起见，我们仍然发送消息，但这种情况不应该发生
-                    await bot.sendMessage(data.chatId, data.text || "消息生成完成").catch(err => {
-                        logWithTimestamp('error', '发送流式结束消息失败:', err.message);
-                    });
-                }
-                return;
-            }
+// --- 处理流式结束信号 ---
+if (data.type === 'stream_end' && data.chatId) {
+  const session = ongoingStreams.get(data.chatId);
+  // 只有当存在会话时才处理，这表明确实是流式传输
+  if (session) {
+    // 清理超时定时器
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+      session.timeoutId = null;
+    }
+    if (session.timer) {
+      clearTimeout(session.timer);
+    }
+    logWithTimestamp('log', `收到流式结束信号，等待最终渲染文本更新...`);
+    // 注意：我们不在这里清理会话，而是等待 final_message_update
+  }
+  // 如果不存在会话但收到 stream_end，这是一个异常情况
+  // 可能是由于某些原因会话被提前清理了
+  else {
+    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
+    // 为安全起见，我们仍然发送消息，但这种情况不应该发生
+    await bot.sendMessage(data.chatId, data.text || "消息生成完成").catch(err => {
+      logWithTimestamp('error', '发送流式结束消息失败:', err.message);
+    });
+  }
+  return;
+}
 
-            // --- 处理最终渲染后的消息更新 ---
-            if (data.type === 'final_message_update' && data.chatId) {
-                const session = ongoingStreams.get(data.chatId);
+// --- 处理最终渲染后的消息更新 ---
+if (data.type === 'final_message_update' && data.chatId) {
+  const session = ongoingStreams.get(data.chatId);
 
-                // 如果会话存在，说明是流式传输的最终更新
-                if (session) {
-                    // 使用 await messagePromise
-                    const messageId = await session.messagePromise;
-                    if (messageId) {
-                        logWithTimestamp('log', `收到流式最终渲染文本，更新消息 ${messageId}`);
-                        await bot.editMessageText(data.text, {
-                            chat_id: data.chatId,
-                            message_id: messageId,
-                            // 可选：在这里指定 parse_mode: 'MarkdownV2' 或 'HTML'
-                            // parse_mode: 'HTML',
-                        }).catch(err => {
-                            if (!err.message.includes('message is not modified'))
-                                logWithTimestamp('error', '编辑最终格式化Telegram消息失败:', err.message);
-                        });
-                        logWithTimestamp('log', `ChatID ${data.chatId} 的流式传输准最终更新已发送。`);
-                    } else {
-                        logWithTimestamp('warn', `收到final_message_update，但流式会话的messageId未能获取。`);
-                    }
-                    // 清理流式会话
-                    ongoingStreams.delete(data.chatId);
-                    logWithTimestamp('log', `ChatID ${data.chatId} 的流式会话已完成并清理。`);
-                }
-                // 如果会话不存在，说明这是一个完整的非流式回复
-                // 注意：这种情况不应该发生，因为我们已经在客户端修复了这个问题
-                // 但为了健壮性，我们仍然保留这个处理
-                else {
-                    logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
-                    await bot.sendMessage(data.chatId, data.text, {
-                        // 可选：在这里指定 parse_mode
-                    }).catch(err => {
-                        logWithTimestamp('error', '发送非流式完整回复失败:', err.message);
-                    });
-                }
-                return;
-            }
+  // 如果会话存在，说明是流式传输的最终更新
+  if (session) {
+    // 清理超时定时器
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+    }
+    // 使用 await messagePromise
+    let messageId;
+    try {
+      messageId = await session.messagePromise;
+    } catch (err) {
+      logWithTimestamp('error', '获取 messageId 失败:', err);
+      // 清理会话
+      if (session.timer) clearTimeout(session.timer);
+      if (session.timeoutId) clearTimeout(session.timeoutId);
+      ongoingStreams.delete(data.chatId);
+      return;
+    }
+    
+    if (messageId) {
+      logWithTimestamp('log', `收到流式最终渲染文本，更新消息 ${messageId}`);
+      await bot.editMessageText(data.text, {
+        chat_id: data.chatId,
+        message_id: messageId,
+        // 可选：在这里指定 parse_mode: 'MarkdownV2' 或 'HTML'
+        // parse_mode: 'HTML',
+      }).catch(err => {
+        if (!err.message.includes('message is not modified'))
+          logWithTimestamp('error', '编辑最终格式化 Telegram 消息失败:', err.message);
+      });
+      logWithTimestamp('log', `ChatID ${data.chatId} 的流式传输准最终更新已发送。`);
+    } else {
+      logWithTimestamp('warn', `收到 final_message_update，但流式会话的 messageId 未能获取。`);
+    }
+    // 清理流式会话
+    if (session.timer) clearTimeout(session.timer);
+    if (session.timeoutId) clearTimeout(session.timeoutId);
+    ongoingStreams.delete(data.chatId);
+    logWithTimestamp('log', `ChatID ${data.chatId} 的流式会话已完成并清理。`);
+  }
+  // 如果会话不存在，说明这是一个完整的非流式回复
+  // 注意：这种情况不应该发生，因为我们已经在客户端修复了这个问题
+  // 但为了健壮性，我们仍然保留这个处理
+  else {
+    logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
+    await bot.sendMessage(data.chatId, data.text, {
+      // 可选：在这里指定 parse_mode
+    }).catch(err => {
+      logWithTimestamp('error', '发送非流式完整回复失败:', err.message);
+    });
+  }
+  return;
+}
 
             // --- 其他消息处理逻辑 ---
             if (data.type === 'error_message' && data.chatId) {
@@ -701,18 +773,24 @@ wss.on('connection', ws => {
         }
     });
 
-    ws.on('close', () => {
-        logWithTimestamp('log', 'SillyTavern扩展已断开连接。');
-        if (ws.commandToExecuteOnClose) {
-            const { command, chatId } = ws.commandToExecuteOnClose;
-            logWithTimestamp('log', `客户端断开连接，现在执行预定命令: ${command}`);
-            if (command === 'reload') reloadServer(chatId);
-            if (command === 'restart') restartServer(chatId);
-            if (command === 'exit') exitServer(chatId);
-        }
-        sillyTavernClient = null;
-        ongoingStreams.clear();
-    });
+ws.on('close', () => {
+  logWithTimestamp('log', 'SillyTavern 扩展已断开连接。');
+  
+  // 立即获取并清空标记，防止重复执行
+  const pending = ws.commandToExecuteOnClose;
+  ws.commandToExecuteOnClose = null;
+  
+  if (pending) {
+    const { command, chatId } = pending;
+    logWithTimestamp('log', `客户端断开连接，现在执行预定命令：${command}`);
+    if (command === 'reload') reloadServer(chatId);
+    if (command === 'restart') restartServer(chatId);
+    if (command === 'exit') exitServer(chatId);
+  }
+  
+  sillyTavernClient = null;
+  ongoingStreams.clear();
+});
 
     ws.on('error', (error) => {
         logWithTimestamp('error', 'WebSocket发生错误:', error);
@@ -749,12 +827,28 @@ function downloadPhoto(fileId) {
 
 // 处理图片消息
 async function handlePhotoMessage(msg, chatId) {
-    try {
-        logWithTimestamp('log', `从Telegram用户 ${chatId} 收到图片消息`);
+  try {
+    logWithTimestamp('log', `从 Telegram 用户 ${chatId} 收到图片消息`);
 
-        // 获取最高分辨率的图片file_id
-        const photos = msg.photo;
-        const fileId = photos[photos.length - 1].file_id;
+    let fileId;
+    
+    // 处理压缩图片（msg.photo 数组）
+    if (msg.photo && msg.photo.length > 0) {
+      // 获取最高分辨率的图片 file_id
+      fileId = msg.photo[msg.photo.length - 1].file_id;
+      logWithTimestamp('log', `处理压缩图片，fileId: ${fileId}`);
+    } 
+    // 处理文件形式的图片（msg.document）
+    else if (msg.document && msg.document.mime_type && 
+             msg.document.mime_type.startsWith('image/')) {
+      fileId = msg.document.file_id;
+      logWithTimestamp('log', `处理文件形式图片，fileId: ${fileId}`);
+    }
+    else {
+      const errorMsg = '收到无效的图片消息格式';
+      logWithTimestamp('error', errorMsg);
+      throw new Error(errorMsg);
+    }
 
         // 获取图片文件URL
         const fileLink = await bot.getFileLink(fileId);
