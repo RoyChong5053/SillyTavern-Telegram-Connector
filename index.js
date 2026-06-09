@@ -165,12 +165,40 @@ function connect() {
                 // 6. 触发SillyTavern的生成流程，并用try...catch包裹
                 // 修改为基于时间的重试机制，最长5分钟
                 const MAX_RETRY_TIME_MS = 5 * 60 * 1000; // 5分钟
+                const MAX_RETRY_ATTEMPTS = 10; // 最大重试次数
                 const INITIAL_DELAY_MS = 3000; // 初始延迟3秒
                 const MAX_DELAY_MS = 30000; // 最大延迟30秒
                 let generationSuccess = false;
                 let lastError = null;
                 let retryCount = 0;
                 const startTime = Date.now();
+
+                // 智能错误分类：区分瞬态错误（可重试）和永久错误（立即失败）
+                function isRetryableError(errorMsg) {
+                    const lower = errorMsg.toLowerCase();
+                    // 瞬态错误：网络/服务端问题，可重试
+                    const transientPatterns = [
+                        '500', 'internal server error',
+                        '503', 'service unavailable',
+                        '504', 'gateway timeout',
+                        '429', 'too many requests', 'rate limit',
+                        'econnreset', 'econnrefused', 'etimedout',
+                        'fetch failed', 'network', 'networkerror',
+                        'socket hang up', 'request timeout',
+                    ];
+                    // 永久错误：认证/配额问题，不应重试
+                    const permanentPatterns = [
+                        '401', '403', 'unauthorized', 'forbidden',
+                        'invalid_api_key', 'api key',
+                        'quota exceeded', 'insufficient_quota',
+                        'content_filter', 'safety',
+                    ];
+                    // 先检查是否为永久错误（优先级更高）
+                    if (permanentPatterns.some(p => lower.includes(p))) {
+                        return false;
+                    }
+                    return transientPatterns.some(p => lower.includes(p));
+                }
 
                 while (!generationSuccess && (Date.now() - startTime) < MAX_RETRY_TIME_MS) {
                     try {
@@ -205,10 +233,16 @@ function connect() {
 
                         console.log(`[Telegram Bridge] Generate错误: ${errorMsg}`);
 
-                        // 只对 500 错误进行重试
-                        if (errorMsg.includes('500') || errorMsg.includes('Internal Server Error') || errorMsg.includes('response status 500')) {
-                            console.log(`[Telegram Bridge] 检测到500错误，准备重试...`);
+                        // 智能错误分类：瞬态错误重试，永久错误立即失败
+                        if (isRetryableError(errorMsg)) {
+                            console.log(`[Telegram Bridge] 检测到瞬态错误，准备重试...`);
                             retryCount++;
+
+                            // 检查是否超过最大重试次数
+                            if (retryCount >= MAX_RETRY_ATTEMPTS) {
+                                console.log(`[Telegram Bridge] 已达到最大重试次数 ${MAX_RETRY_ATTEMPTS}，停止重试`);
+                                break;
+                            }
 
                             // 检查是否超过最大重试时间
                             if ((Date.now() - startTime) >= MAX_RETRY_TIME_MS) {
@@ -218,12 +252,13 @@ function connect() {
                             continue;
                         }
 
-                        // 非500错误: 立即失败
-                        console.error("[Telegram Bridge] Generate() 非500错误:", error);
+                        // 永久错误: 立即失败
+                        console.error("[Telegram Bridge] Generate() 永久错误:", error);
                         await deleteLastMessage();
                         console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
 
                         const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
+                        // 注意：不向用户暴露技术细节，只记录日志
                         if (ws && ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({
                                 type: 'error_message',
