@@ -179,6 +179,7 @@ function connect() {
                     // 瞬态错误：网络/服务端问题，可重试
                     const transientPatterns = [
                         '500', 'internal server error',
+                        '502', 'bad gateway',
                         '503', 'service unavailable',
                         '504', 'gateway timeout',
                         '429', 'too many requests', 'rate limit',
@@ -543,62 +544,50 @@ jQuery(async () => {
 
 // 全局事件监听器，用于最终消息更新
 function handleFinalMessage(lastMessageIdInChatArray) {
-    // 确保WebSocket已连接，并且我们有一个有效的chatId来发送更新
-    if (!ws || ws.readyState !== WebSocket.OPEN || !lastProcessedChatId) {
+    const chatId = lastProcessedChatId;
+    lastProcessedChatId = null;
+
+    if (!ws || ws.readyState !== WebSocket.OPEN || !chatId) {
         return;
     }
 
     const lastMessageIndex = lastMessageIdInChatArray - 1;
     if (lastMessageIndex < 0) return;
 
-    // 延迟以确保DOM更新完成
     setTimeout(() => {
-        // 直接调用全局的 SillyTavern.getContext()
         const context = SillyTavern.getContext();
         const lastMessage = context.chat[lastMessageIndex];
 
-        // 确认这是我们刚刚通过Telegram触发的AI回复
         if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
             const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
 
             if (messageElement.length > 0) {
-                // 获取消息文本元素
                 const messageTextElement = messageElement.find('.mes_text');
 
-                // 获取HTML内容并替换<br>和</p><p>为换行符
                 let renderedText = messageTextElement.html()
                     .replace(/<br\s*\/?>/gi, '\n')
                     .replace(/<\/p>\s*<p>/gi, '\n\n')
-                // .replace(/<[^>]*>/g, ''); // 移除所有其他HTML标签
 
-                // 解码HTML实体
                 const tempDiv = document.createElement('div');
                 tempDiv.innerHTML = renderedText;
                 renderedText = tempDiv.textContent;
 
-                console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${lastProcessedChatId}`);
+                console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${chatId}`);
 
-                // 判断是流式还是非流式响应
                 if (isStreamingMode) {
-                    // 流式响应 - 发送final_message_update
                     ws.send(JSON.stringify({
                         type: 'final_message_update',
-                        chatId: lastProcessedChatId,
+                        chatId: chatId,
                         text: renderedText,
                     }));
-                    // 重置流式模式标志
                     isStreamingMode = false;
                 } else {
-                    // 非流式响应 - 直接发送ai_reply
                     ws.send(JSON.stringify({
                         type: 'ai_reply',
-                        chatId: lastProcessedChatId,
+                        chatId: chatId,
                         text: renderedText,
                     }));
                 }
-
-                // 重置chatId，避免意外更新其他用户的消息
-                lastProcessedChatId = null;
             }
         }
     }, 100);

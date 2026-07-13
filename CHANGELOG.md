@@ -1,5 +1,40 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-07-13 - 稳定性优化 v3（假死修复 & 多回复丢失修复）
+
+### 核心 Bug 修复
+
+#### 1. 修复 `lastProcessedChatId` 竞态条件导致多回复丢失
+- **根因**: `handleFinalMessage` 在 `setTimeout` 内部重置 `lastProcessedChatId = null`，前一条消息的 timeout 会在后一条消息生成期间触发，误清变量导致后续回复全部被静默丢弃
+- **修复**: 在 `handleFinalMessage` 入口立即将 `lastProcessedChatId` 抓取到局部变量并全局置 null，timeout 内部使用局部变量，消除跨消息竞争
+
+#### 2. 修复 Telegram 轮询假死
+- **根因**: 未监听 `bot.on('polling_error')`，Telegram API 返回 502 时库进入 degraded 状态停止处理新消息
+- **修复**: 
+  - 添加 `polling_error` 监听器，连续 5 次错误后自动重启轮询
+  - 添加每 60 秒 `getMe()` 健康检查，异常时自动恢复
+
+#### 3. 修复消息超过 4096 字符被 Telegram 静默拒绝
+- **根因**: `bot.sendMessage()` / `bot.editMessageText()` 均无长度检查
+- **修复**: 新增 `splitMessage()` 按换行/句号智能分片，加 `(1/N)` 前缀；`sendSplitMessage()` 包装自动分片发送；`editMessageText` 截断至 4096
+
+#### 4. WebSocket 心跳检测 & 断开保护
+- 新增每 30s ping/pong 心跳检测，超时自动断开
+- WS 断开后延迟 30s 清理流式会话，给客户端重连窗口
+
+#### 5. 客户端 502 可重试
+- `isRetryableError` 添加 `'502', 'bad gateway'` 到瞬态错误列表
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `index.js:547-548` | `handleFinalMessage` 竞态修复 |
+| `index.js:180` | 添加 502 到可重试列表 |
+| `server/server.js` | polling_error 监听 + 健康检查 + 消息分片 + WS 心跳 + 延迟清理 |
+
+---
+
 ## 2026-04-25 - 稳定性优化 v2
 
 ### 核心改进

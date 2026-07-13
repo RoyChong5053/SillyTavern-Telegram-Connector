@@ -177,6 +177,23 @@ logWithTimestamp('log', '正在初始化Telegram Bot...');
 const wss = new WebSocket.Server({ port: wssPort });
 logWithTimestamp('log', `WebSocket服务器正在监听端口 ${wssPort}...`);
 
+// WebSocket心跳检测：每30秒ping客户端
+const HEARTBEAT_INTERVAL_MS = 30000;
+const heartbeatTimer = setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (ws.isAlive === false) {
+            logWithTimestamp('warn', 'WebSocket客户端心跳超时，断开连接');
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+    clearInterval(heartbeatTimer);
+});
+
 let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
 
 // 用于存储正在进行的流式会话，调整会话结构，使用Promise来处理messageId
@@ -185,6 +202,50 @@ const ongoingStreams = new Map();
 
 // 用于存储每个聊天最后一条消息的文本，以便重发
 const lastMessages = new Map();
+
+// Telegram 消息长度限制
+const MAX_TELEGRAM_LENGTH = 4096;
+
+function splitMessage(text, maxLength = MAX_TELEGRAM_LENGTH) {
+    if (text.length <= maxLength) return [text];
+    const chunks = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+        if (remaining.length <= maxLength) {
+            chunks.push(remaining);
+            break;
+        }
+        let splitAt = remaining.lastIndexOf('\n', maxLength);
+        if (splitAt === -1 || splitAt < maxLength * 0.5) {
+            splitAt = Math.max(
+                remaining.lastIndexOf('。', maxLength),
+                remaining.lastIndexOf('.', maxLength),
+                remaining.lastIndexOf('？', maxLength),
+                remaining.lastIndexOf('?', maxLength),
+                remaining.lastIndexOf('\n', maxLength),
+            );
+        }
+        if (splitAt === -1 || splitAt < maxLength * 0.3) {
+            splitAt = maxLength;
+        }
+        chunks.push(remaining.slice(0, splitAt + 1));
+        remaining = remaining.slice(splitAt + 1).trim();
+    }
+    if (chunks.length > 1) {
+        return chunks.map((chunk, i) => `(${i + 1}/${chunks.length})\n${chunk}`);
+    }
+    return chunks;
+}
+
+function sendSplitMessage(chatId, text, extra = {}) {
+    const chunks = splitMessage(text);
+    const promises = chunks.map((chunk, i) => {
+        return bot.sendMessage(chatId, chunk, i === 0 ? extra : {}).catch(err => {
+            logWithTimestamp('error', `发送分片消息 ${i + 1}/${chunks.length} 失败: ${err.message}`);
+        });
+    });
+    return Promise.all(promises);
+}
 
 // 重载服务器函数
 function reloadServer(chatId) {
@@ -301,6 +362,7 @@ function exitServer() {
         process.exit(1);
     }, 10000);
     try {
+        clearInterval(heartbeatTimer);
         if (fs.existsSync(RESTART_PROTECTION_FILE)) {
             fs.unlinkSync(RESTART_PROTECTION_FILE);
             logWithTimestamp('log', '已清理重启保护文件');
@@ -520,6 +582,8 @@ async function handleTelegramCommand(command, args, chatId) {
 wss.on('connection', ws => {
     logWithTimestamp('log', 'SillyTavern扩展已连接！');
     sillyTavernClient = ws;
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', async (message) => { // 将整个回调设为async
         let data; // 在 try 块外部声明 data
@@ -620,7 +684,8 @@ if (data.type === 'stream_chunk' && data.chatId) {
         
         if (currentMessageId) {
           currentSession.isEditing = true;
-          bot.editMessageText(currentSession.lastText + ' ...', {
+          const previewText = (currentSession.lastText + ' ...').slice(0, MAX_TELEGRAM_LENGTH);
+          bot.editMessageText(previewText, {
             chat_id: data.chatId,
             message_id: currentMessageId,
           }).catch(err => {
@@ -660,9 +725,7 @@ if (data.type === 'stream_end' && data.chatId) {
   else {
     logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
     // 为安全起见，我们仍然发送消息，但这种情况不应该发生
-    await bot.sendMessage(data.chatId, data.text || "消息生成完成").catch(err => {
-      logWithTimestamp('error', '发送流式结束消息失败:', err.message);
-    });
+    await sendSplitMessage(data.chatId, data.text || "消息生成完成");
   }
   return;
 }
@@ -692,11 +755,10 @@ if (data.type === 'final_message_update' && data.chatId) {
     
     if (messageId) {
       logWithTimestamp('log', `收到流式最终渲染文本，更新消息 ${messageId}`);
-      await bot.editMessageText(data.text, {
+      const finalText = data.text.slice(0, MAX_TELEGRAM_LENGTH);
+      await bot.editMessageText(finalText, {
         chat_id: data.chatId,
         message_id: messageId,
-        // 可选：在这里指定 parse_mode: 'MarkdownV2' 或 'HTML'
-        // parse_mode: 'HTML',
       }).catch(err => {
         if (!err.message.includes('message is not modified'))
           logWithTimestamp('error', '编辑最终格式化 Telegram 消息失败:', err.message);
@@ -716,11 +778,7 @@ if (data.type === 'final_message_update' && data.chatId) {
   // 但为了健壮性，我们仍然保留这个处理
   else {
     logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
-    await bot.sendMessage(data.chatId, data.text, {
-      // 可选：在这里指定 parse_mode
-    }).catch(err => {
-      logWithTimestamp('error', '发送非流式完整回复失败:', err.message);
-    });
+    await sendSplitMessage(data.chatId, data.text);
   }
   return;
 }
@@ -728,15 +786,12 @@ if (data.type === 'final_message_update' && data.chatId) {
             // --- 其他消息处理逻辑 ---
             if (data.type === 'error_message' && data.chatId) {
                 logWithTimestamp('error', `收到SillyTavern的错误报告，将发送至Telegram用户 ${data.chatId}: ${data.text}`);
-                // 发送错误消息，并附带"重发"按钮
-                bot.sendMessage(data.chatId, data.text, {
+                sendSplitMessage(data.chatId, data.text, {
                     reply_markup: {
                         inline_keyboard: [[
                             { text: '🔄 重发消息', callback_data: `resend_${data.chatId}` }
                         ]]
                     }
-                }).catch(err => {
-                    logWithTimestamp('error', '发送错误消息失败:', err.message);
                 });
             } else if (data.type === 'retry_status' && data.chatId) {
                 // 发送重试状态更新（可以编辑之前的状态消息，或发送新消息）
@@ -749,10 +804,8 @@ if (data.type === 'final_message_update' && data.chatId) {
                     logWithTimestamp('log', `清理 ChatID ${data.chatId} 的流式会话，因为收到了非流式回复`);
                     ongoingStreams.delete(data.chatId);
                 }
-                // 发送非流式回复
-                await bot.sendMessage(data.chatId, data.text).catch(err => {
-                    logWithTimestamp('error', `发送非流式AI回复失败: ${err.message}`);
-                });
+                // 发送非流式回复（已内含分片处理）
+                await sendSplitMessage(data.chatId, data.text);
             } else if (data.type === 'typing_action' && data.chatId) {
                 logWithTimestamp('log', `显示"输入中"状态给Telegram用户 ${data.chatId}`);
                 bot.sendChatAction(data.chatId, 'typing').catch(error =>
@@ -776,7 +829,6 @@ if (data.type === 'final_message_update' && data.chatId) {
 ws.on('close', () => {
   logWithTimestamp('log', 'SillyTavern 扩展已断开连接。');
   
-  // 立即获取并清空标记，防止重复执行
   const pending = ws.commandToExecuteOnClose;
   ws.commandToExecuteOnClose = null;
   
@@ -789,16 +841,28 @@ ws.on('close', () => {
   }
   
   sillyTavernClient = null;
-  ongoingStreams.clear();
+  
+  // 延迟30秒清理流式会话，给客户端重连窗口
+  setTimeout(() => {
+    if (!sillyTavernClient && ongoingStreams.size > 0) {
+      logWithTimestamp('log', `客户端未重连，清理 ${ongoingStreams.size} 个残留流式会话`);
+      ongoingStreams.clear();
+    }
+  }, 30000);
 });
 
     ws.on('error', (error) => {
         logWithTimestamp('error', 'WebSocket发生错误:', error);
         if (sillyTavernClient) {
-            sillyTavernClient.commandToExecuteOnClose = null; // 清除标记，防止意外执行
+            sillyTavernClient.commandToExecuteOnClose = null;
         }
         sillyTavernClient = null;
-        ongoingStreams.clear();
+        setTimeout(() => {
+            if (!sillyTavernClient && ongoingStreams.size > 0) {
+                logWithTimestamp('log', `清理 ${ongoingStreams.size} 个残留的流式会话`);
+                ongoingStreams.clear();
+            }
+        }, 30000);
     });
 });
 
@@ -914,6 +978,47 @@ if (process.env.RESTART_NOTIFY_CHATID) {
         }, 2000);
     }
 }
+
+// --- 轮询错误监听 & 自动恢复 ---
+let pollingErrorCount = 0;
+const MAX_POLLING_ERRORS = 5;
+
+bot.on('polling_error', (error) => {
+    pollingErrorCount++;
+    logWithTimestamp('error', `[polling_error] (${pollingErrorCount}/${MAX_POLLING_ERRORS}) ${error.message}`);
+
+    if (pollingErrorCount >= MAX_POLLING_ERRORS) {
+        logWithTimestamp('warn', '轮询错误次数过多，正在重启轮询...');
+        pollingErrorCount = 0;
+        bot.stopPolling().then(() => {
+            bot.startPolling({ restart: true, clean: true });
+            logWithTimestamp('log', 'Telegram Bot轮询已重启');
+        }).catch(err => {
+            logWithTimestamp('error', '重启轮询失败:', err);
+        });
+    }
+});
+
+// 健康检查：每60秒确认bot存活
+const HEALTH_CHECK_INTERVAL = 60000;
+setInterval(() => {
+    bot.getMe().then(() => {
+        pollingErrorCount = 0;
+    }).catch(err => {
+        logWithTimestamp('error', '健康检查失败，bot可能已断开:', err.message);
+        pollingErrorCount++;
+        if (pollingErrorCount >= MAX_POLLING_ERRORS) {
+            logWithTimestamp('warn', '健康检查多次失败，正在重启轮询...');
+            pollingErrorCount = 0;
+            bot.stopPolling().then(() => {
+                bot.startPolling({ restart: true, clean: true });
+                logWithTimestamp('log', 'Telegram Bot轮询已重启（健康检查触发）');
+            }).catch(err => {
+                logWithTimestamp('error', '重启轮询失败:', err);
+            });
+        }
+    });
+}, HEALTH_CHECK_INTERVAL);
 
 // 监听Telegram消息
 bot.on('message', async (msg) => {
