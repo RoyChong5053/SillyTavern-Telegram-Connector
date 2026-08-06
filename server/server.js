@@ -590,6 +590,12 @@ wss.on('connection', ws => {
         try {
             data = JSON.parse(message);
 
+// --- 处理前端心跳（客户端主动保活探测） ---
+if (data.type === 'heartbeat') {
+  ws.send(JSON.stringify({ type: 'heartbeat_ack' }));
+  return;
+}
+
 // --- 处理流式文本块 ---
 if (data.type === 'stream_chunk' && data.chatId) {
   let session = ongoingStreams.get(data.chatId);
@@ -840,7 +846,10 @@ ws.on('close', () => {
     if (command === 'exit') exitServer(chatId);
   }
   
-  sillyTavernClient = null;
+  // 仅当全局引用仍指向本连接时才清空，避免旧 socket 误杀已重连的新连接
+  if (sillyTavernClient === ws) {
+    sillyTavernClient = null;
+  }
   
   // 延迟30秒清理流式会话，给客户端重连窗口
   setTimeout(() => {
@@ -853,10 +862,11 @@ ws.on('close', () => {
 
     ws.on('error', (error) => {
         logWithTimestamp('error', 'WebSocket发生错误:', error);
-        if (sillyTavernClient) {
+        // 仅当全局引用仍指向本连接时才清空，避免旧 socket 误杀已重连的新连接
+        if (sillyTavernClient === ws) {
             sillyTavernClient.commandToExecuteOnClose = null;
+            sillyTavernClient = null;
         }
-        sillyTavernClient = null;
         setTimeout(() => {
             if (!sillyTavernClient && ongoingStreams.size > 0) {
                 logWithTimestamp('log', `清理 ${ongoingStreams.size} 个残留的流式会话`);

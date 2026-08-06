@@ -21,6 +21,7 @@ import {
     openCharacterChat,
     Generate,
     setExternalAbortController,
+    isGenerating,
 } from "../../../../script.js";
 
 const MODULE_NAME = 'SillyTavern-Telegram-Connector';
@@ -30,13 +31,36 @@ const DEFAULT_SETTINGS = {
 };
 
 let ws = null; // WebSocket实例
-let lastProcessedChatId = null; // 用于存储最后处理过的Telegram chatId
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const RECONNECT_DELAY_MS = 3000;
+let reconnectStartTime = 0;
+let reconnectTimer = null;
+let manuallyDisconnected = false;
+let heartbeatTimer = null;
+let lastActivityTime = Date.now();
+let reloadCounterResetTimer = null;
 
-// 添加一个全局变量来跟踪当前是否处于流式模式
-let isStreamingMode = false;
+// 重连策略：无限次数 + 指数退避，超过时限后自动刷新页面兜底
+const MAX_RECONNECT_DURATION_MS = 90 * 1000; // 重连窗口 90 秒
+const BASE_RECONNECT_DELAY_MS = 1000;
+const MAX_RECONNECT_DELAY_MS = 30000;
+
+// 前端心跳：检测“假死”连接
+const HEARTBEAT_INTERVAL_MS = 15000;
+const HEARTBEAT_STALE_MS = 45000;
+
+// 自动刷新兜底：防止服务器真挂时无限刷新循环
+const MAX_AUTO_RELOADS = 3;
+const RELOAD_COUNTER_KEY = 'telegram_auto_reload_count';
+
+// ST 卡死看门狗
+const JOB_ACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 非流式慢模型宽限 15 分钟
+const STREAM_SILENCE_TIMEOUT_MS = 60 * 1000;    // 流式生成 60 秒无新 chunk 判定卡死
+const FINAL_REPLY_TIMEOUT_MS = 30 * 1000;       // 生成完成后 30 秒无最终回复判定卡死
+
+// FIFO 串行消息队列：一次只处理一条消息，杜绝并发 Generate() 导致的 ST 状态卡死
+const messageQueue = [];
+let processingMessage = false;
+let currentJob = null;
 
 // --- 工具函数 ---
 function getSettings() {
@@ -57,12 +81,393 @@ function updateStatus(message, color) {
 function reloadPage() {
     window.location.reload();
 }
-// ---
+
+// 智能错误分类：区分瞬态错误（可重试）和永久错误（立即失败）
+function isRetryableError(errorMsg) {
+    const lower = errorMsg.toLowerCase();
+    // 瞬态错误：网络/服务端问题，可重试
+    const transientPatterns = [
+        '500', 'internal server error',
+        '502', 'bad gateway',
+        '503', 'service unavailable',
+        '504', 'gateway timeout',
+        '429', 'too many requests', 'rate limit',
+        'econnreset', 'econnrefused', 'etimedout',
+        'fetch failed', 'network', 'networkerror',
+        'socket hang up', 'request timeout',
+    ];
+    // 永久错误：认证/配额问题，不应重试
+    const permanentPatterns = [
+        '401', '403', 'unauthorized', 'forbidden',
+        'invalid_api_key', 'api key',
+        'quota exceeded', 'insufficient_quota',
+        'content_filter', 'safety',
+    ];
+    // 先检查是否为永久错误（优先级更高）
+    if (permanentPatterns.some(p => lower.includes(p))) {
+        return false;
+    }
+    return transientPatterns.some(p => lower.includes(p));
+}
+
+// --- 自动刷新兜底 ---
+function getAutoReloadCount() {
+    try {
+        return parseInt(sessionStorage.getItem(RELOAD_COUNTER_KEY) || '0', 10) || 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+function performAutoReload(logMsg) {
+    if (manuallyDisconnected) return;
+    const count = getAutoReloadCount();
+    if (count >= MAX_AUTO_RELOADS) {
+        console.error(`[Telegram Bridge] 已达到自动刷新次数上限(${MAX_AUTO_RELOADS})，请手动检查服务器后刷新页面`);
+        updateStatus('自动恢复失败，请检查服务器', 'red');
+        return;
+    }
+    try {
+        sessionStorage.setItem(RELOAD_COUNTER_KEY, String(count + 1));
+    } catch (e) { }
+    console.log(`${logMsg} (自动刷新 ${count + 1}/${MAX_AUTO_RELOADS})`);
+    setTimeout(reloadPage, 500);
+}
+
+function startReloadCounterResetTimer() {
+    if (reloadCounterResetTimer) clearTimeout(reloadCounterResetTimer);
+    reloadCounterResetTimer = setTimeout(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                sessionStorage.removeItem(RELOAD_COUNTER_KEY);
+            } catch (e) { }
+            console.log('[Telegram Bridge] 连接已稳定，重置自动刷新计数');
+        }
+    }, 5 * 60 * 1000);
+}
+
+// --- 前端心跳 ---
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        // 超过 45 秒没有任何消息（含 heartbeat_ack），判定连接假死，强制断开触发重连
+        if (Date.now() - lastActivityTime > HEARTBEAT_STALE_MS) {
+            console.log('[Telegram Bridge] 心跳超时(45秒无消息)，强制断开触发重连');
+            ws.close();
+            return;
+        }
+        ws.send(JSON.stringify({ type: 'heartbeat' }));
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
+}
+
+// --- 重连 ---
+function scheduleReconnect() {
+    if (manuallyDisconnected) return;
+    if (reconnectTimer) return; // 已安排重连
+    const settings = getSettings();
+    if (!settings.autoConnect) return;
+
+    // 重连窗口耗尽 → 自动刷新页面兜底
+    if (reconnectStartTime === 0) {
+        reconnectStartTime = Date.now();
+    }
+    if (Date.now() - reconnectStartTime >= MAX_RECONNECT_DURATION_MS) {
+        reconnectStartTime = 0;
+        updateStatus('连接失败，准备自动刷新...', 'orange');
+        performAutoReload('[Telegram Bridge] 重连超时，自动刷新页面');
+        return;
+    }
+
+    const delay = Math.min(
+        BASE_RECONNECT_DELAY_MS * Math.pow(2, reconnectAttempts) + Math.random() * 1000,
+        MAX_RECONNECT_DELAY_MS
+    );
+    reconnectAttempts++;
+    console.log(`[Telegram Bridge] 尝试重新连接 (${reconnectAttempts})，${Math.round(delay)}ms 后...`);
+    updateStatus(`重连中 (${reconnectAttempts})...`, 'orange');
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+    }, delay);
+}
+
+// --- FIFO 队列 / 任务状态 ---
+function clearJobTimers(job) {
+    if (!job) return;
+    if (job.activityTimer) clearTimeout(job.activityTimer);
+    if (job.finalReplyTimer) clearTimeout(job.finalReplyTimer);
+    job.activityTimer = null;
+    job.finalReplyTimer = null;
+}
+
+function finishJob(job) {
+    if (job && currentJob !== job) return;
+    clearJobTimers(currentJob);
+    currentJob = null;
+    processingMessage = false;
+    processQueue();
+}
+
+function armActivityTimer(job) {
+    clearTimeout(job.activityTimer);
+    const timeout = job.isStreamingMode ? STREAM_SILENCE_TIMEOUT_MS : JOB_ACTIVITY_TIMEOUT_MS;
+    job.activityTimer = setTimeout(() => {
+        if (currentJob === job) {
+            onJobWedged(job, job.isStreamingMode ? '流式生成60秒无新内容' : '生成15分钟无响应');
+        }
+    }, timeout);
+}
+
+function onJobWedged(job, reason) {
+    console.error(`[Telegram Bridge] SillyTavern疑似卡死(${reason})，准备自愈`);
+    if (currentJob === job && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'error_message',
+            chatId: job.chatId,
+            text: 'SillyTavern生成无响应（可能已卡死），正在自动刷新页面恢复。请稍候片刻再重发消息。',
+        }));
+    }
+    finishJob(job);
+    performAutoReload(`[Telegram Bridge] ${reason}，自动刷新页面`);
+}
+
+async function processQueue() {
+    if (processingMessage) return;
+    if (messageQueue.length === 0) return;
+    processingMessage = true;
+    const job = messageQueue.shift();
+    currentJob = job;
+    await processMessageJob(job);
+}
+
+async function processMessageJob(job) {
+    let cleanup = null;
+    try {
+        // 1. 立即向Telegram发送“输入中”状态
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'typing_action', chatId: job.chatId }));
+        }
+
+        // 1.5 若 SillyTavern 正在手动生成，等待其完成，避免并发 Generate 卡死 ST
+        //     上限 2 分钟，超过则判定卡死并自愈
+        const WAIT_ST_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+        const waitStart = Date.now();
+        while (isGenerating()) {
+            if (Date.now() - waitStart > WAIT_ST_IDLE_TIMEOUT_MS) {
+                onJobWedged(job, '等待SillyTavern空闲超时(2分钟)');
+                return;
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        // 2. 将用户消息添加到SillyTavern
+        await sendMessageAsUser(job.text);
+
+        // 2.5 如果有inline image，将其添加到最新消息的extra.media中
+        if (job.inlineImage) {
+            console.log('[Telegram Bridge] 收到inline image，正在附加到消息...');
+            const context = SillyTavern.getContext();
+            const lastMsg = context.chat[context.chat.length - 1];
+            if (lastMsg && lastMsg.is_user) {
+                if (!lastMsg.extra) lastMsg.extra = {};
+                if (!Array.isArray(lastMsg.extra.media)) lastMsg.extra.media = [];
+                lastMsg.extra.media.push({
+                    url: job.inlineImage,
+                    type: 'image',
+                    title: 'Telegram Image',
+                    source: 'api',
+                });
+                lastMsg.extra.inline_image = true;
+                // 保存聊天
+                if (context.saveChatConditional) {
+                    await context.saveChatConditional();
+                }
+                console.log('[Telegram Bridge] Inline image已附加到消息。');
+            }
+        }
+
+        // 3. 设置流式传输的回调
+        job.streamCallback = (cumulativeText) => {
+            if (currentJob !== job) return;
+            job.isStreamingMode = true;
+            armActivityTimer(job); // 有流块 = 活跃，重置卡死计时
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'stream_chunk',
+                    chatId: job.chatId,
+                    text: cumulativeText,
+                }));
+            }
+        };
+        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, job.streamCallback);
+
+        // 4. 定义一个清理函数（发送 stream_end；最终回复由 handleFinalMessage 负责）
+        cleanup = () => {
+            if (currentJob !== job) return;
+            if (job.cleanupDone) return;
+            job.cleanupDone = true;
+            eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, job.streamCallback);
+            if (ws && ws.readyState === WebSocket.OPEN && job.isStreamingMode) {
+                if (!job.error) {
+                    ws.send(JSON.stringify({ type: 'stream_end', chatId: job.chatId }));
+                }
+            }
+        };
+
+        // 5. 监听生成结束事件，确保无论成功与否都执行清理
+        //    注意: 使用 once 确保监听器只执行一次
+        eventSource.once(event_types.GENERATION_ENDED, cleanup);
+        eventSource.once(event_types.GENERATION_STOPPED, cleanup);
+
+        // 6. 启动活动看门狗
+        armActivityTimer(job);
+
+        // 7. 触发SillyTavern的生成流程，并用try...catch包裹
+        const MAX_RETRY_TIME_MS = 5 * 60 * 1000; // 5分钟
+        const MAX_RETRY_ATTEMPTS = 10; // 最大重试次数
+        const INITIAL_DELAY_MS = 3000; // 初始延迟3秒
+        const MAX_DELAY_MS = 30000; // 最大延迟30秒
+        let generationSuccess = false;
+        let lastError = null;
+        let retryCount = 0;
+        const startTime = Date.now();
+
+        while (!generationSuccess && (Date.now() - startTime) < MAX_RETRY_TIME_MS) {
+            try {
+                if (retryCount > 0) {
+                    // 计算指数退避延迟（带随机抖动）
+                    const delay = Math.min(
+                        INITIAL_DELAY_MS * Math.pow(2, retryCount - 1) + Math.random() * 1000,
+                        MAX_DELAY_MS
+                    );
+                    console.log(`[Telegram Bridge] AI生成重试 (${retryCount}), 等待 ${Math.round(delay)}ms... (已用时: ${Math.round((Date.now() - startTime) / 1000)}s)`);
+
+                    // 向Telegram发送重试状态
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'retry_status',
+                            chatId: job.chatId,
+                            retryCount: retryCount,
+                            elapsedTime: Math.round((Date.now() - startTime) / 1000),
+                        }));
+                    }
+
+                    await new Promise(r => setTimeout(r, delay));
+                }
+
+                const abortController = new AbortController();
+                setExternalAbortController(abortController);
+                await Generate('normal', { signal: abortController.signal });
+                generationSuccess = true;
+            } catch (error) {
+                lastError = error;
+                const errorMsg = error.message || '';
+
+                console.log(`[Telegram Bridge] Generate错误: ${errorMsg}`);
+
+                // 智能错误分类：瞬态错误重试，永久错误立即失败
+                if (isRetryableError(errorMsg)) {
+                    console.log(`[Telegram Bridge] 检测到瞬态错误，准备重试...`);
+                    retryCount++;
+
+                    // 检查是否超过最大重试次数
+                    if (retryCount >= MAX_RETRY_ATTEMPTS) {
+                        console.log(`[Telegram Bridge] 已达到最大重试次数 ${MAX_RETRY_ATTEMPTS}，停止重试`);
+                        break;
+                    }
+
+                    // 检查是否超过最大重试时间
+                    if ((Date.now() - startTime) >= MAX_RETRY_TIME_MS) {
+                        console.log(`[Telegram Bridge] 已达到最大重试时间 ${MAX_RETRY_TIME_MS / 1000}秒`);
+                        break;
+                    }
+                    continue;
+                }
+
+                // 永久错误: 立即失败
+                console.error("[Telegram Bridge] Generate() 永久错误:", error);
+                await deleteLastMessage();
+                console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
+
+                const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
+                // 注意：不向用户暴露技术细节，只记录日志
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'error_message',
+                        chatId: job.chatId,
+                        text: errorMessage,
+                    }));
+                }
+
+                job.error = true;
+                cleanup();
+                finishJob(job);
+                return;
+            }
+        }
+
+        // 所有重试都失败（超时或达到最大重试次数）
+        if (!generationSuccess && lastError) {
+            console.error("[Telegram Bridge] 所有重试都失败:", lastError);
+
+            // 删除SillyTavern中残留的用户消息
+            await deleteLastMessage();
+            console.log('[Telegram Bridge] 已删除重试失败的用户消息。');
+
+            const elapsedTime = Math.round((Date.now() - startTime) / 1000);
+            const errorMessage = `抱歉，AI生成回复超时（${elapsedTime}秒）。\n您的上一条消息已被撤回，请稍后重试。\n\n错误详情: ${lastError.message || '请求超时'}`;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'error_message',
+                    chatId: job.chatId,
+                    text: errorMessage,
+                }));
+            }
+            job.error = true;
+            cleanup();
+            finishJob(job);
+            return;
+        }
+
+        // 生成成功：等待最终回复（GENERATION_ENDED → handleFinalMessage）
+        // 若 30 秒内未收到最终回复，判定 ST 卡死并自愈
+        clearTimeout(job.activityTimer);
+        job.finalReplyTimer = setTimeout(() => {
+            if (currentJob === job) {
+                onJobWedged(job, '生成完成但30秒未收到最终回复');
+            }
+        }, FINAL_REPLY_TIMEOUT_MS);
+    } catch (error) {
+        console.error('[Telegram Bridge] 处理消息时发生错误:', error);
+        // 清理残留的用户消息
+        try {
+            await deleteLastMessage();
+        } catch (e) { }
+        if (currentJob === job && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'error_message',
+                chatId: job.chatId,
+                text: '处理您的消息时发生了一个内部错误。',
+            }));
+        }
+        job.error = true;
+        if (cleanup) cleanup();
+        finishJob(job);
+    }
+}
 
 // 连接到WebSocket服务器
 function connect() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        console.log('[Telegram Bridge] 已连接');
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        console.log('[Telegram Bridge] 已连接或正在连接中');
         return;
     }
 
@@ -72,229 +477,46 @@ function connect() {
         return;
     }
 
+    manuallyDisconnected = false;
     updateStatus('连接中...', 'orange');
     console.log(`[Telegram Bridge] 正在连接 ${settings.bridgeUrl}...`);
 
-    ws = new WebSocket(settings.bridgeUrl);
+    const socket = new WebSocket(settings.bridgeUrl);
+    ws = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
+        if (ws !== socket) return; // 防止旧 socket 覆盖新 socket
         console.log('[Telegram Bridge] 连接成功！');
         updateStatus('已连接', 'green');
         reconnectAttempts = 0;
+        reconnectStartTime = 0;
+        lastActivityTime = Date.now();
+        startHeartbeat();
+        startReloadCounterResetTimer();
     };
 
-    ws.onmessage = async (event) => {
+    socket.onmessage = async (event) => {
+        if (ws !== socket) return;
+        lastActivityTime = Date.now();
+
         let data;
         try {
             data = JSON.parse(event.data);
 
-            // --- 用户消息处理 ---
+            // --- 心跳应答 ---
+            if (data.type === 'heartbeat_ack') {
+                return;
+            }
+
+            // --- 用户消息处理：进入 FIFO 队列串行处理 ---
             if (data.type === 'user_message') {
-                console.log('[Telegram Bridge] 收到用户消息。', data);
-
-                // 存储当前处理的chatId
-                lastProcessedChatId = data.chatId;
-
-                // 默认情况下，假设不是流式模式
-                isStreamingMode = false;
-
-                // 1. 立即向Telegram发送“输入中”状态（无论是否流式）
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'typing_action', chatId: data.chatId }));
-                }
-
-                // 2. 将用户消息添加到SillyTavern
-                await sendMessageAsUser(data.text);
-
-                // 2.5 如果有inline image，将其添加到最新消息的extra.media中
-                if (data.inlineImage) {
-                    console.log('[Telegram Bridge] 收到inline image，正在附加到消息...');
-                    const context = SillyTavern.getContext();
-                    const lastMsg = context.chat[context.chat.length - 1];
-                    if (lastMsg && lastMsg.is_user) {
-                        if (!lastMsg.extra) lastMsg.extra = {};
-                        if (!Array.isArray(lastMsg.extra.media)) lastMsg.extra.media = [];
-                        lastMsg.extra.media.push({
-                            url: data.inlineImage,
-                            type: 'image',
-                            title: 'Telegram Image',
-                            source: 'api',
-                        });
-                        lastMsg.extra.inline_image = true;
-                        // 保存聊天
-                        if (context.saveChatConditional) {
-                            await context.saveChatConditional();
-                        }
-                        console.log('[Telegram Bridge] Inline image已附加到消息。');
-                    }
-                }
-
-                // 3. 设置流式传输的回调
-                const streamCallback = (cumulativeText) => {
-                    // 标记为流式模式
-                    isStreamingMode = true;
-                    // 将每个文本块通过WebSocket发送到服务端
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'stream_chunk',
-                            chatId: data.chatId,
-                            text: cumulativeText,
-                        }));
-                    }
-                };
-                eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-
-                // 4. 定义一个清理函数
-                const cleanup = () => {
-                    eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-                    if (ws && ws.readyState === WebSocket.OPEN && isStreamingMode) {
-                        // 仅在没有错误且确实处于流式模式时发送stream_end
-                        if (!data.error) {
-                            ws.send(JSON.stringify({ type: 'stream_end', chatId: data.chatId }));
-                        }
-                    }
-                    // 注意：不在这里重置isStreamingMode，让handleFinalMessage函数来处理
-                };
-
-                // 5. 监听生成结束事件，确保无论成功与否都执行清理
-                // 注意: 我们现在使用once来确保这个监听器只执行一次，避免干扰后续的全局监听器
-                eventSource.once(event_types.GENERATION_ENDED, cleanup);
-                // 添加对手动停止生成的处理
-                eventSource.once(event_types.GENERATION_STOPPED, cleanup);
-
-                // 6. 触发SillyTavern的生成流程，并用try...catch包裹
-                // 修改为基于时间的重试机制，最长5分钟
-                const MAX_RETRY_TIME_MS = 5 * 60 * 1000; // 5分钟
-                const MAX_RETRY_ATTEMPTS = 10; // 最大重试次数
-                const INITIAL_DELAY_MS = 3000; // 初始延迟3秒
-                const MAX_DELAY_MS = 30000; // 最大延迟30秒
-                let generationSuccess = false;
-                let lastError = null;
-                let retryCount = 0;
-                const startTime = Date.now();
-
-                // 智能错误分类：区分瞬态错误（可重试）和永久错误（立即失败）
-                function isRetryableError(errorMsg) {
-                    const lower = errorMsg.toLowerCase();
-                    // 瞬态错误：网络/服务端问题，可重试
-                    const transientPatterns = [
-                        '500', 'internal server error',
-                        '502', 'bad gateway',
-                        '503', 'service unavailable',
-                        '504', 'gateway timeout',
-                        '429', 'too many requests', 'rate limit',
-                        'econnreset', 'econnrefused', 'etimedout',
-                        'fetch failed', 'network', 'networkerror',
-                        'socket hang up', 'request timeout',
-                    ];
-                    // 永久错误：认证/配额问题，不应重试
-                    const permanentPatterns = [
-                        '401', '403', 'unauthorized', 'forbidden',
-                        'invalid_api_key', 'api key',
-                        'quota exceeded', 'insufficient_quota',
-                        'content_filter', 'safety',
-                    ];
-                    // 先检查是否为永久错误（优先级更高）
-                    if (permanentPatterns.some(p => lower.includes(p))) {
-                        return false;
-                    }
-                    return transientPatterns.some(p => lower.includes(p));
-                }
-
-                while (!generationSuccess && (Date.now() - startTime) < MAX_RETRY_TIME_MS) {
-                    try {
-                        if (retryCount > 0) {
-                            // 计算指数退避延迟（带随机抖动）
-                            const delay = Math.min(
-                                INITIAL_DELAY_MS * Math.pow(2, retryCount - 1) + Math.random() * 1000,
-                                MAX_DELAY_MS
-                            );
-                            console.log(`[Telegram Bridge] AI生成重试 (${retryCount}), 等待 ${Math.round(delay)}ms... (已用时: ${Math.round((Date.now() - startTime) / 1000)}s)`);
-
-                            // 向Telegram发送重试状态
-                            if (ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({
-                                    type: 'retry_status',
-                                    chatId: data.chatId,
-                                    retryCount: retryCount,
-                                    elapsedTime: Math.round((Date.now() - startTime) / 1000),
-                                }));
-                            }
-
-                            await new Promise(r => setTimeout(r, delay));
-                        }
-
-                        const abortController = new AbortController();
-                        setExternalAbortController(abortController);
-                        await Generate('normal', { signal: abortController.signal });
-                        generationSuccess = true;
-                    } catch (error) {
-                        lastError = error;
-                        const errorMsg = error.message || '';
-
-                        console.log(`[Telegram Bridge] Generate错误: ${errorMsg}`);
-
-                        // 智能错误分类：瞬态错误重试，永久错误立即失败
-                        if (isRetryableError(errorMsg)) {
-                            console.log(`[Telegram Bridge] 检测到瞬态错误，准备重试...`);
-                            retryCount++;
-
-                            // 检查是否超过最大重试次数
-                            if (retryCount >= MAX_RETRY_ATTEMPTS) {
-                                console.log(`[Telegram Bridge] 已达到最大重试次数 ${MAX_RETRY_ATTEMPTS}，停止重试`);
-                                break;
-                            }
-
-                            // 检查是否超过最大重试时间
-                            if ((Date.now() - startTime) >= MAX_RETRY_TIME_MS) {
-                                console.log(`[Telegram Bridge] 已达到最大重试时间 ${MAX_RETRY_TIME_MS / 1000}秒`);
-                                break;
-                            }
-                            continue;
-                        }
-
-                        // 永久错误: 立即失败
-                        console.error("[Telegram Bridge] Generate() 永久错误:", error);
-                        await deleteLastMessage();
-                        console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
-
-                        const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
-                        // 注意：不向用户暴露技术细节，只记录日志
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({
-                                type: 'error_message',
-                                chatId: data.chatId,
-                                text: errorMessage,
-                            }));
-                        }
-
-                        data.error = true;
-                        cleanup();
-                        return; // 非500错误直接返回，不继续重试
-                    }
-                }
-
-                // 所有重试都失败（超时或达到最大重试时间）
-                if (!generationSuccess && lastError) {
-                    console.error("[Telegram Bridge] 所有重试都失败:", lastError);
-
-                    // 删除SillyTavern中残留的用户消息
-                    await deleteLastMessage();
-                    console.log('[Telegram Bridge] 已删除重试失败的用户消息。');
-
-                    const elapsedTime = Math.round((Date.now() - startTime) / 1000);
-                    const errorMessage = `抱歉，AI生成回复超时（${elapsedTime}秒）。\n您的上一条消息已被撤回，请稍后重试。\n\n错误详情: ${lastError.message || '请求超时'}`;
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'error_message',
-                            chatId: data.chatId,
-                            text: errorMessage,
-                        }));
-                    }
-                    data.error = true;
-                    cleanup();
-                }
-
+                console.log('[Telegram Bridge] 收到用户消息，加入队列。', data);
+                messageQueue.push({
+                    chatId: data.chatId,
+                    text: data.text,
+                    inlineImage: data.inlineImage,
+                });
+                processQueue();
                 return;
             }
 
@@ -474,29 +696,30 @@ function connect() {
         }
     };
 
-    ws.onclose = () => {
-        console.log('[Telegram Bridge] 连接已关闭。');
+    socket.onclose = () => {
+        if (ws !== socket) return;
         ws = null;
+        stopHeartbeat();
+        console.log('[Telegram Bridge] 连接已关闭。');
         updateStatus('已断开', 'red');
 
-        const settings = getSettings();
-        if (settings.autoConnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-            reconnectAttempts++;
-            console.log(`[Telegram Bridge] 尝试重新连接 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-            setTimeout(connect, RECONNECT_DELAY_MS);
-        } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            updateStatus('重连失败，请检查服务器', 'red');
+        if (!manuallyDisconnected) {
+            scheduleReconnect();
         }
     };
 
-    ws.onerror = (error) => {
+    socket.onerror = (error) => {
         console.error('[Telegram Bridge] WebSocket错误:', error);
     };
 }
 
 function disconnect() {
+    manuallyDisconnected = true;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
     if (ws) {
-        reconnectAttempts = MAX_RECONNECT_ATTEMPTS;
         ws.close();
     }
 }
@@ -544,17 +767,30 @@ jQuery(async () => {
 
 // 全局事件监听器，用于最终消息更新
 function handleFinalMessage(lastMessageIdInChatArray) {
-    const chatId = lastProcessedChatId;
-    lastProcessedChatId = null;
-
-    if (!ws || ws.readyState !== WebSocket.OPEN || !chatId) {
+    // 仅处理当前由 Telegram 触发的生成任务
+    const job = currentJob;
+    if (!job) {
         return;
     }
 
+    // WebSocket 未连接：无法送达回复，但仍需结束该任务，避免队列卡死
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn('[Telegram Bridge] 生成完成但WebSocket未连接，跳过推送并结束任务');
+        finishJob(job);
+        return;
+    }
+
+    const chatId = job.chatId;
     const lastMessageIndex = lastMessageIdInChatArray - 1;
-    if (lastMessageIndex < 0) return;
+    if (lastMessageIndex < 0) {
+        finishJob(job);
+        return;
+    }
 
     setTimeout(() => {
+        // 仅当该任务仍处于进行中才处理（防止过期任务影响新任务）
+        if (currentJob !== job) return;
+
         const context = SillyTavern.getContext();
         const lastMessage = context.chat[lastMessageIndex];
 
@@ -574,13 +810,13 @@ function handleFinalMessage(lastMessageIdInChatArray) {
 
                 console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${chatId}`);
 
-                if (isStreamingMode) {
+                if (job.isStreamingMode) {
                     ws.send(JSON.stringify({
                         type: 'final_message_update',
                         chatId: chatId,
                         text: renderedText,
                     }));
-                    isStreamingMode = false;
+                    job.isStreamingMode = false;
                 } else {
                     ws.send(JSON.stringify({
                         type: 'ai_reply',
@@ -590,6 +826,8 @@ function handleFinalMessage(lastMessageIdInChatArray) {
                 }
             }
         }
+
+        finishJob(job);
     }, 100);
 }
 

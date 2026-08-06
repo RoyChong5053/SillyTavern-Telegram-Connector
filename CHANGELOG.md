@@ -1,5 +1,36 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-08-07 - 稳定性优化 v4（并发串台根治 & ST 卡死自愈）
+
+### 核心 Bug 修复
+
+#### 1. 修复并发消息串台 / 丢回复（快速连发文本+图片只回最新一条）
+- **根因**: `ws.onmessage` 是 `async`，两条 `user_message` 被并发处理，两个 `Generate()` 同时执行。ST 的 `Generate()` 无内部并发锁（`is_send_press` 守卫只在 UI 路径），`is_send_press` / `streamingProcessor` / `abortController` 均为模块级单例，被并发调用互相覆盖，导致回复串台或静默丢失
+- **修复**: 前端新增 FIFO 串行消息队列（`messageQueue` / `processingMessage` / `currentJob`），一条完整走完再处理下一条；删除全局 `lastProcessedChatId` / `isStreamingMode`，改为 `currentJob` 上的字段；新增 `isGenerating()` 等待 ST 空闲
+
+#### 2. 修复偶发"停止工作"（刷新页面即恢复）
+- **根因**: 并发 Generate 会把 ST 内部状态卡死（`streamingProcessor` 残留 / `is_send_press` 卡 true），之后所有 Generate() 静默无响应，只有刷新页面能重置 ST 的 JS 状态
+- **修复**:
+  - FIFO 串行队列从源头杜绝并发 Generate
+  - 新增 ST 卡死看门狗（生成完成 30s 无最终回复 / 流式 60s 无新 chunk / 非流式 15 分钟无响应 → 判卡死 → 发错误提示 → 自动刷新自愈）
+  - 重连改为无限次数 + 指数退避（1s→30s 封顶），重连窗口耗尽（90s）自动刷新页面（sessionStorage 限制每会话最多 3 次，连接稳定 5 分钟清零）
+  - 前端心跳 15s + 45s 假死判定，强制断开触发重连
+  - 修复 `connect()` CONNECTING 竞态；`onclose`/`onerror` 用 `ws === this` 判空
+
+#### 3. 服务端修复（server/server.js）
+- `ws.on('close')` / `ws.on('error')` 仅当 `sillyTavernClient === ws` 时才置空，避免旧连接断开事件误杀已重连的新连接（消息流静默全断的隐患）
+- 新增 `{type:'heartbeat'}` → `{type:'heartbeat_ack'}` 应答
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `index.js` | FIFO 串行队列 + ST 卡死看门狗 + 无限重连/心跳/自动刷新兜底 |
+| `server/server.js` | sillyTavernClient 判空 + 心跳应答 |
+| `docs/concurrent-messages-and-st-freeze.md` | 新增排查文档 |
+
+---
+
 ## 2026-07-13 - 稳定性优化 v3（假死修复 & 多回复丢失修复）
 
 ### 核心 Bug 修复
