@@ -95,6 +95,9 @@ function isRetryableError(errorMsg) {
         'econnreset', 'econnrefused', 'etimedout',
         'fetch failed', 'network', 'networkerror',
         'socket hang up', 'request timeout',
+        // 提供方请求超时 / 生成被中断：多为限流或 fallback 链较慢导致的瞬态问题
+        'timed out', 'provider timed out', 'timeout',
+        'aborted', 'abort',
     ];
     // 永久错误：认证/配额问题，不应重试
     const permanentPatterns = [
@@ -360,6 +363,9 @@ async function processMessageJob(job) {
                         }));
                     }
 
+                    // 每次重试前重置活动看门狗，避免累计退避时长触发误杀
+                    armActivityTimer(job);
+
                     await new Promise(r => setTimeout(r, delay));
                 }
 
@@ -404,6 +410,9 @@ async function processMessageJob(job) {
                         type: 'error_message',
                         chatId: job.chatId,
                         text: errorMessage,
+                        // 携带原始失败消息，便于 server 端“重发”按钮精确重发
+                        resendText: job.text,
+                        resendInlineImage: job.inlineImage || undefined,
                     }));
                 }
 
@@ -429,6 +438,9 @@ async function processMessageJob(job) {
                     type: 'error_message',
                     chatId: job.chatId,
                     text: errorMessage,
+                    // 携带原始失败消息，便于 server 端“重发”按钮精确重发
+                    resendText: job.text,
+                    resendInlineImage: job.inlineImage || undefined,
                 }));
             }
             job.error = true;
@@ -456,6 +468,9 @@ async function processMessageJob(job) {
                 type: 'error_message',
                 chatId: job.chatId,
                 text: '处理您的消息时发生了一个内部错误。',
+                // 携带原始失败消息，便于 server 端“重发”按钮精确重发
+                resendText: job.text,
+                resendInlineImage: job.inlineImage || undefined,
             }));
         }
         job.error = true;

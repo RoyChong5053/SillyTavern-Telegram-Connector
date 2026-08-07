@@ -1,5 +1,42 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-08-07 - 稳定性优化 v5（Provider 超时重试 & 重发按钮精确化）
+
+### 背景
+用户在 Telegram 端偶发收到 `Provider timed out after 24013ms` 错误。排查确认：底层 one-api 其实发生了 provider 自动 fallback（429 → 切换到备用 channel），但整条 fallback 链耗时约 26s，超过 ST 请求超时（约 24s），ST 将请求标记为超时中止。这是"上游还在重试、ST 已放弃"的竞态，对插件而言属于可重试的瞬态错误，却被当成了永久错误。
+
+### 核心修复
+
+#### 1. 提供方超时/中断归类为可重试（index.js）
+- `isRetryableError()` 的瞬态模式新增 `'timed out'` / `'provider timed out'` / `'timeout'` / `'aborted'` / `'abort'`
+- 这类错误现在会进入指数退避重试（最长 5 分钟），而不是直接撤回消息 + 报错
+- 永久错误（401/403/配额/安全过滤）优先级不变，仍立即失败
+
+#### 2. 重发按钮精确重发（index.js + server/server.js）
+- **旧问题**: server 端 `lastMessages` 只按 `chatId` 存**文本**，图片消息从不记录；错误按钮 `resend_<chatId>` 只会重发"上一条文本"——图片失败后点重发会发错消息甚至发到上上轮的文本
+- **修复**:
+  - index.js 在所有 `error_message` 载荷中附带 `resendText` / `resendInlineImage`（即失败消息的原文与图片）
+  - server.js 新增 `pendingResends` 按消息维度存储，每次失败生成唯一 token（`resend_<token>` 作为按钮 callback_data，规避 Telegram 64 字节限制）
+  - 点击按钮按 token 精确找回原始文本 + 图片并重发，图片消息也照常重发
+  - 图片消息（`handlePhotoMessage`）现在也会记录进 `lastMessages`，兼容旧格式按钮
+  - token 使用后立即失效，防止重复重发；`pendingResends` 上限 100 条，超限淘汰最旧记录
+
+#### 3. 看门狗不再误杀合法重试（index.js）
+- 每次重试尝试前重置活动看门狗计时器（`armActivityTimer(job)`）
+- 避免累计退避时长（3s→30s 递增）触发"流式 60s 无新 chunk"误判，把还在退避等待的重试当成 ST 卡死而自动刷新
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `index.js` | isRetryableError 新增 timeout/abort 瞬态模式；error_message 附带 resendText/resendInlineImage；每次重试重置看门狗 |
+| `server/server.js` | 新增 pendingResends 按消息存储；error_message 用 token 按钮；callback 精确重发文本+图片；图片消息记录 lastMessages |
+
+### 验证
+- `node --check` 通过（index.js / server/server.js）
+
+---
+
 ## 2026-08-07 - 稳定性优化 v4（并发串台根治 & ST 卡死自愈）
 
 ### 核心 Bug 修复

@@ -200,8 +200,36 @@ let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
 // 结构: { messagePromise: Promise<number> | null, lastText: String, timer: NodeJS.Timeout | null, isEditing: boolean }
 const ongoingStreams = new Map();
 
-// 用于存储每个聊天最后一条消息的文本，以便重发
+// 用于存储每个聊天最后一条消息的内容（文本/图片），以便兼容旧格式按钮重发
 const lastMessages = new Map();
+
+// 用于精确重发：每次失败生成唯一 token 作为 key，保存失败消息的原文与图片。
+// Telegram callback_data 限制 64 字节，因此不能把消息内容塞进按钮，只能存服务端。
+const pendingResends = new Map();
+const MAX_PENDING_RESENDS = 100;
+
+function createResendToken() {
+    return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function recordPendingResend(chatId, text, inlineImage) {
+    const token = createResendToken();
+    pendingResends.set(token, { chatId, text, inlineImage: inlineImage || null, ts: Date.now() });
+
+    // 防止无限增长：超过上限时淘汰最旧的记录
+    if (pendingResends.size > MAX_PENDING_RESENDS) {
+        let oldestKey = null;
+        let oldestTs = Infinity;
+        pendingResends.forEach((v, k) => {
+            if (v.ts < oldestTs) {
+                oldestTs = v.ts;
+                oldestKey = k;
+            }
+        });
+        if (oldestKey) pendingResends.delete(oldestKey);
+    }
+    return token;
+}
 
 // Telegram 消息长度限制
 const MAX_TELEGRAM_LENGTH = 4096;
@@ -792,13 +820,19 @@ if (data.type === 'final_message_update' && data.chatId) {
             // --- 其他消息处理逻辑 ---
             if (data.type === 'error_message' && data.chatId) {
                 logWithTimestamp('error', `收到SillyTavern的错误报告，将发送至Telegram用户 ${data.chatId}: ${data.text}`);
-                sendSplitMessage(data.chatId, data.text, {
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: '🔄 重发消息', callback_data: `resend_${data.chatId}` }
-                        ]]
-                    }
-                });
+                // 若前端带回失败消息原文，则登记为精确重发目标（按钮携带唯一token而非消息内容）
+                let replyMarkup = {};
+                if (data.resendText) {
+                    const token = recordPendingResend(data.chatId, data.resendText, data.resendInlineImage);
+                    replyMarkup = {
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '🔄 重发消息', callback_data: `resend_${token}` }
+                            ]]
+                        }
+                    };
+                }
+                sendSplitMessage(data.chatId, data.text, replyMarkup);
             } else if (data.type === 'retry_status' && data.chatId) {
                 // 发送重试状态更新（可以编辑之前的状态消息，或发送新消息）
                 logWithTimestamp('log', `重试状态: 第${data.retryCount}次重试，已用时${data.elapsedTime}秒`);
@@ -956,6 +990,8 @@ async function handlePhotoMessage(msg, chatId) {
         // 通过extra字段传递inlineImage数据URI，由前端添加到消息的extra.media中
         if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
             logWithTimestamp('log', `向SillyTavern发送inline image消息`);
+            // 存储图片消息（含caption）以便重发
+            lastMessages.set(chatId, { text: caption, inlineImage: inlineImageUri, ts: Date.now() });
             const payload = JSON.stringify({
                 type: 'user_message',
                 chatId,
@@ -1084,8 +1120,8 @@ bot.on('message', async (msg) => {
     // 处理普通消息
     if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
         logWithTimestamp('log', `从Telegram用户 ${chatId} 收到消息: "${text}"`);
-        // 存储消息文本以便重发
-        lastMessages.set(chatId, text);
+        // 存储消息内容以便重发
+        lastMessages.set(chatId, { text, inlineImage: null, ts: Date.now() });
         const payload = JSON.stringify({ type: 'user_message', chatId, text });
         sillyTavernClient.send(payload);
     } else {
@@ -1105,25 +1141,29 @@ bot.on('callback_query', async (query) => {
     });
 
     if (data.startsWith('resend_')) {
-        const callbackChatId = parseInt(data.split('_')[1]);
+        const token = data.slice('resend_'.length);
+        const entry = pendingResends.get(token) || null;
 
-        // 验证chatId是否匹配
-        if (callbackChatId !== chatId) {
-            logWithTimestamp('warn', `回调chatId ${callbackChatId} 与消息chatId ${chatId} 不匹配`);
+        // 精确重发时校验chatId归属
+        if (entry && entry.chatId !== chatId) {
+            logWithTimestamp('warn', `回调chatId ${chatId} 与记录chatId ${entry.chatId} 不匹配`);
             return;
         }
 
-        // 获取存储的消息文本
-        const lastText = lastMessages.get(chatId);
-        if (!lastText) {
-            logWithTimestamp('warn', `没有找到chatId ${chatId} 的消息文本用于重发`);
+        // 优先使用token对应的原始消息；兼容旧格式按钮（resend_<chatId>）或无记录时回退到最近一条消息
+        const latest = lastMessages.get(chatId);
+        const resendText = entry ? entry.text : (latest ? latest.text : null);
+        const resendInlineImage = entry ? entry.inlineImage : (latest ? latest.inlineImage : null);
+
+        if (!resendText) {
+            logWithTimestamp('warn', `没有找到chatId ${chatId} 的消息内容用于重发`);
             bot.sendMessage(chatId, '无法重发：未找到原始消息内容。请重新发送。').catch(err => {
                 logWithTimestamp('error', '发送错误消息失败:', err.message);
             });
             return;
         }
 
-        logWithTimestamp('log', `用户请求重发消息到 chatId ${chatId}: "${lastText}"`);
+        logWithTimestamp('log', `用户请求重发消息到 chatId ${chatId}: "${resendText}"${resendInlineImage ? '（含图片）' : ''}`);
 
         // 检查SillyTavern是否连接
         if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
@@ -1133,9 +1173,13 @@ bot.on('callback_query', async (query) => {
             return;
         }
 
-        // 重新发送消息到SillyTavern
-        const payload = JSON.stringify({ type: 'user_message', chatId, text: lastText });
-        sillyTavernClient.send(payload);
-        logWithTimestamp('log', `已重发消息到SillyTavern: "${lastText}"`);
+        // 重新发送消息到SillyTavern（含图片，若有）
+        const payload = { type: 'user_message', chatId, text: resendText };
+        if (resendInlineImage) payload.inlineImage = resendInlineImage;
+        sillyTavernClient.send(JSON.stringify(payload));
+        logWithTimestamp('log', `已重发消息到SillyTavern: "${resendText}"${resendInlineImage ? '（含图片）' : ''}`);
+
+        // 使用过的token立即失效，避免重复重发
+        if (entry) pendingResends.delete(token);
     }
 });

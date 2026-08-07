@@ -30,12 +30,13 @@ SillyTavern Telegram Connector 是一个为 SillyTavern 设计的扩展，允许
   - WebSocket 自动重连（最多 10 次，每次间隔 3 秒）
 - **错误处理优化**：
   - 错误消息附带"🔄 重发消息"按钮，无需复制粘贴
+  - 重发按钮精确重发**失败的那条消息**（含图片），不再退回"上一条文本"
+  - 提供方请求超时/中断（如 `Provider timed out`）归为可重试错误，自动指数退避重试
   - 重试失败后自动清理 SillyTavern 中的残留消息
   - 流式传输优化：生成足够字数后再显示初始信息
   - 实现 AI 生成重试机制（最长 5 分钟，指数退避）
   - 实现 Telegram API 重试机制（429/500 错误）
   - 实现 WebSocket 自动重连
-  - 错误消息附带"重发"按钮，无需复制粘贴
   - 自动清理重试失败后的残留消息
 
 ### 架构特点
@@ -109,6 +110,11 @@ SillyTavern Telegram Connector 是一个为 SillyTavern 设计的扩展，允许
 ## 开发和更新日志
 
 查看 [CHANGELOG.md](CHANGELOG.md) 了解详细的开发进度和技术细节。
+
+排查文档：
+- [Provider 超时 + 重发按钮发错消息](docs/provider-timeout-and-resend-button.md)
+- [并发消息串台 + ST 卡死](docs/concurrent-messages-and-st-freeze.md)
+- [消息超过 4096 字符](docs/message-too-long-error.md)
 
 ## 支持和贡献
 
