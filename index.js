@@ -635,6 +635,31 @@ function connect() {
                             }
                             break;
                         }
+                        case 'reranker': {
+                            const $rerankCheckbox = $('#vectors_rerank_enabled');
+                            if (!$rerankCheckbox.length) {
+                                replyText = '未找到Vector Storage插件的Reranker开关，请确认该扩展已启用并刷新页面。';
+                                break;
+                            }
+                            const rerankArg = ((data.args && data.args[0]) || '').toLowerCase();
+                            const rerankCurrent = $rerankCheckbox.prop('checked');
+                            if (!rerankArg) {
+                                replyText = `Reranker当前状态：${rerankCurrent ? '开启' : '关闭'}。\n用法: /reranker on 或 /reranker off`;
+                                commandSuccess = true;
+                                break;
+                            }
+                            let rerankTarget = null;
+                            if (['on', 'true', '1', '开', '开启'].includes(rerankArg)) rerankTarget = true;
+                            else if (['off', 'false', '0', '关', '关闭'].includes(rerankArg)) rerankTarget = false;
+                            if (rerankTarget === null) {
+                                replyText = '无效参数。用法: /reranker on | /reranker off | /reranker（查看状态）';
+                                break;
+                            }
+                            $rerankCheckbox.prop('checked', rerankTarget).trigger('input');
+                            replyText = `Reranker已${rerankTarget ? '开启' : '关闭'}。`;
+                            commandSuccess = true;
+                            break;
+                        }
                         default: {
                             // 处理特殊格式的命令，如 switchchar_1, switchchat_2 等
                             const charMatch = data.command.match(/^switchchar_(\d+)$/);
@@ -839,7 +864,12 @@ function handleFinalMessage(lastMessageIdInChatArray) {
                         text: renderedText,
                     }));
                 }
+            } else {
+                console.warn(`[Telegram Bridge] 未找到消息DOM元素 mesid=${lastMessageIndex}，跳过推送（DOM可能尚未渲染完成）`);
             }
+        } else {
+            console.warn(`[Telegram Bridge] 最终消息校验未通过 mesid=${lastMessageIndex}`,
+                lastMessage ? { is_user: !!lastMessage.is_user, is_system: !!lastMessage.is_system } : '消息对象不存在');
         }
 
         finishJob(job);

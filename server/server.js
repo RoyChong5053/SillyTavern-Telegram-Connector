@@ -203,6 +203,9 @@ const ongoingStreams = new Map();
 // 用于存储每个聊天最后一条消息的内容（文本/图片），以便兼容旧格式按钮重发
 const lastMessages = new Map();
 
+// 用于存储每个聊天最近一条成功送达的AI回复全文，供 /repush 命令重新推送
+const lastAiReplies = new Map();
+
 // 用于精确重发：每次失败生成唯一 token 作为 key，保存失败消息的原文与图片。
 // Telegram callback_data 限制 64 字节，因此不能把消息内容塞进按钮，只能存服务端。
 const pendingResends = new Map();
@@ -505,6 +508,9 @@ async function handleTelegramCommand(command, args, chatId) {
         replyText += `/restart - 刷新ST网页并重启插件的服务器端组件。\n`;
         replyText += `/exit - 退出插件的服务器端组件。\n`;
         replyText += `/ping - 检查连接状态。\n\n`;
+        replyText += `实用功能\n`;
+        replyText += `/repush - 重新推送上一条AI回复到Telegram（消息丢失时使用）。\n`;
+        replyText += `/reranker [on|off] - 查看或开关Vector Storage插件的Reranker。\n\n`;
         replyText += `帮助\n`;
         replyText += `/help - 显示此帮助信息。`;
 
@@ -512,6 +518,20 @@ async function handleTelegramCommand(command, args, chatId) {
         bot.sendMessage(chatId, replyText).catch(err => {
             logWithTimestamp('error', `发送命令回复失败: ${err.message}`);
         });
+        return;
+    }
+
+    // /repush 只需重推服务器内存中保存的上一条AI回复，不依赖SillyTavern连接
+    if (command === 'repush') {
+        const lastReply = lastAiReplies.get(chatId);
+        if (!lastReply || !lastReply.text) {
+            bot.sendMessage(chatId, '当前会话没有可重推的AI回复记录。').catch(err => {
+                logWithTimestamp('error', `发送命令回复失败: ${err.message}`);
+            });
+            return;
+        }
+        logWithTimestamp('log', `向 chatId ${chatId} 重推上一条AI回复 (${lastReply.text.length} 字符)`);
+        await sendSplitMessage(chatId, lastReply.text);
         return;
     }
 
@@ -575,6 +595,15 @@ async function handleTelegramCommand(command, args, chatId) {
                 return;
             }
             break;
+        case 'reranker':
+            // 发送命令到前端执行，由前端操作Vector Storage插件的Reranker开关
+            sillyTavernClient.send(JSON.stringify({
+                type: 'execute_command',
+                command: 'reranker',
+                args: args,
+                chatId: chatId
+            }));
+            return;
         default:
             // 处理特殊格式的命令，如 switchchar_1, switchchat_2 等
             const charMatch = command.match(/^switchchar_(\d+)$/);
@@ -797,6 +826,7 @@ if (data.type === 'final_message_update' && data.chatId) {
         if (!err.message.includes('message is not modified'))
           logWithTimestamp('error', '编辑最终格式化 Telegram 消息失败:', err.message);
       });
+      lastAiReplies.set(data.chatId, { text: finalText, ts: Date.now() });
       logWithTimestamp('log', `ChatID ${data.chatId} 的流式传输准最终更新已发送。`);
     } else {
       logWithTimestamp('warn', `收到 final_message_update，但流式会话的 messageId 未能获取。`);
@@ -813,6 +843,7 @@ if (data.type === 'final_message_update' && data.chatId) {
   else {
     logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
     await sendSplitMessage(data.chatId, data.text);
+    lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
   }
   return;
 }
@@ -846,6 +877,7 @@ if (data.type === 'final_message_update' && data.chatId) {
                 }
                 // 发送非流式回复（已内含分片处理）
                 await sendSplitMessage(data.chatId, data.text);
+                lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
             } else if (data.type === 'typing_action' && data.chatId) {
                 logWithTimestamp('log', `显示"输入中"状态给Telegram用户 ${data.chatId}`);
                 bot.sendChatAction(data.chatId, 'typing').catch(error =>
