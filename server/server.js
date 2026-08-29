@@ -1057,43 +1057,169 @@ if (process.env.RESTART_NOTIFY_CHATID) {
     }
 }
 
-// --- 轮询错误监听 & 自动恢复 ---
+// --- 轮询错误监听 & 自动恢复（带退避 + retry_after 尊重 + 去重刷屏） ---
 let pollingErrorCount = 0;
+let pollingErrorTimestamps = []; // 滑动窗口
 const MAX_POLLING_ERRORS = 5;
+const POLLING_ERROR_WINDOW_MS = 60000; // 1分钟内计满才触发窗口重启
+const BASE_POLLING_BACKOFF_MS = 1000;
+const MAX_POLLING_BACKOFF_MS = 30000;
+let pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
+let pollingRestartTimer = null;
+let lastPollingErrorLog = { key: '', time: 0 };
+
+// 解析 Telegram 429 的 retry_after（秒）
+function parseRetryAfter(error) {
+    try {
+        // node-telegram-bot-api 的 TelegramError 会把原始 response 挂在 error.response
+        const body = error.response && error.response.body;
+        if (body) {
+            const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+            if (parsed && parsed.parameters && typeof parsed.parameters.retry_after === 'number') {
+                return parsed.parameters.retry_after;
+            }
+            if (parsed && typeof parsed.description === 'string') {
+                const m = parsed.description.match(/retry after (\d+)/i);
+                if (m) return parseInt(m[1], 10);
+            }
+        }
+    } catch (_) { /* ignore */ }
+    const m2 = (error.message || '').match(/retry after (\d+)/i);
+    if (m2) return parseInt(m2[1], 10);
+    return null;
+}
+
+function isTooManyRequests(error) {
+    const msg = (error.message || '').toLowerCase();
+    const code = error.code || '';
+    return code === 'ETELEGRAM' && (msg.includes('429') || msg.includes('too many requests')) || msg.includes('retry after');
+}
+
+function isTransientPollingError(error) {
+    const msg = (error.message || '').toLowerCase();
+    return msg.includes('502') || msg.includes('bad gateway') || msg.includes('500') || msg.includes('503') || msg.includes('504')
+        || msg.includes('econnreset') || msg.includes('etimedout') || msg.includes('fetch failed') || msg.includes('network');
+}
+
+function schedulePollingRestart(delayMs, reason) {
+    if (pollingRestartTimer) return; // 已有待执行的重启，避免叠加
+    logWithTimestamp('warn', `将在 ${Math.round(delayMs / 1000)}s 后重启轮询（原因: ${reason}）`);
+    pollingRestartTimer = setTimeout(() => {
+        pollingRestartTimer = null;
+        bot.stopPolling().then(() => {
+            // startPolling 内部会按 interval=300ms 恢复；restart:true 允许覆盖现有轮询
+            return bot.startPolling({ restart: true });
+        }).then(() => {
+            logWithTimestamp('log', `Telegram Bot轮询已重启（${reason}）`);
+        }).catch(err => {
+            logWithTimestamp('error', '重启轮询失败:', err && err.message ? err.message : err);
+            // 重启失败则退避重试
+            const nextDelay = Math.min(pollingBackoffMs * 2, MAX_POLLING_BACKOFF_MS);
+            pollingBackoffMs = nextDelay;
+            schedulePollingRestart(nextDelay, '重启失败退避重试');
+        });
+    }, delayMs);
+}
 
 bot.on('polling_error', (error) => {
-    pollingErrorCount++;
-    logWithTimestamp('error', `[polling_error] (${pollingErrorCount}/${MAX_POLLING_ERRORS}) ${error.message}`);
+    const now = Date.now();
+    const msg = error.message || String(error);
+    const key = msg.slice(0, 80); // 去重 key：截断避免参数影响
+    const is429 = isTooManyRequests(error);
 
-    if (pollingErrorCount >= MAX_POLLING_ERRORS) {
-        logWithTimestamp('warn', '轮询错误次数过多，正在重启轮询...');
-        pollingErrorCount = 0;
-        bot.stopPolling().then(() => {
-            bot.startPolling({ restart: true, clean: true });
-            logWithTimestamp('log', 'Telegram Bot轮询已重启');
-        }).catch(err => {
-            logWithTimestamp('error', '重启轮询失败:', err);
-        });
+    // 去重刷屏：相同错误 5 秒内只打印一次详情，其余静默计数
+    if (key === lastPollingErrorLog.key && (now - lastPollingErrorLog.time) < 5000) {
+        // 静默计数但不刷日志
+        if (!is429) {
+            pollingErrorTimestamps.push(now);
+            pollingErrorTimestamps = pollingErrorTimestamps.filter(t => now - t < POLLING_ERROR_WINDOW_MS);
+        }
+    } else {
+        lastPollingErrorLog = { key, time: now };
+        if (is429) {
+            const retryAfterSec = parseRetryAfter(error) || 5;
+            const delayMs = retryAfterSec * 1000 + Math.random() * 1000;
+            logWithTimestamp('warn', `[polling_error] 429 Too Many Requests: retry after ${retryAfterSec}s，已抑制刷屏，将在 ${retryAfterSec + 1}s 后重启轮询。若多台机器共用同一 Token 请只保留一台轮询。 详情: ${msg}`);
+            pollingBackoffMs = Math.max(pollingBackoffMs, delayMs);
+            schedulePollingRestart(delayMs, `429限流退避 ${retryAfterSec}s`);
+            return;
+        }
+
+        // 非 429：计入滑动窗口
+        pollingErrorCount++;
+        pollingErrorTimestamps.push(now);
+        pollingErrorTimestamps = pollingErrorTimestamps.filter(t => now - t < POLLING_ERROR_WINDOW_MS);
+        const windowCount = pollingErrorTimestamps.length;
+        const isTransient = isTransientPollingError(error);
+        const backoff = isTransient
+            ? Math.min(BASE_POLLING_BACKOFF_MS * Math.pow(2, windowCount - 1) + Math.random() * 1000, MAX_POLLING_BACKOFF_MS)
+            : Math.min(pollingBackoffMs * 1.5 + Math.random() * 500, MAX_POLLING_BACKOFF_MS);
+        pollingBackoffMs = backoff;
+
+        logWithTimestamp('error', `[polling_error] (${pollingErrorCount}/${MAX_POLLING_ERRORS} 窗口内${windowCount}次) ${msg} | 退避 ${Math.round(backoff)}ms`);
+
+        if (windowCount >= MAX_POLLING_ERRORS) {
+            logWithTimestamp('warn', `轮询错误在 ${POLLING_ERROR_WINDOW_MS / 1000}s 窗口内已达 ${windowCount} 次，触发退避重启`);
+            pollingErrorTimestamps = [];
+            pollingErrorCount = 0;
+            schedulePollingRestart(backoff, `窗口内${windowCount}次错误`);
+        } else if (windowCount >= 3) {
+            // 3次以上就提前退避重启，避免等到5次刷屏
+            schedulePollingRestart(backoff, `连续${windowCount}次瞬态错误`);
+        }
+        // 1-2 次的瞬态错误（典型 WiFi 抖动 502）仅记录日志，不立即重启，靠库自身 300ms 重试自愈
+    }
+
+    // 若是 429 的被抑制分支，也需要按 retry_after 调度一次
+    if (is429) {
+        const retryAfterSec = parseRetryAfter(error) || 5;
+        const delayMs = retryAfterSec * 1000 + Math.random() * 1000;
+        schedulePollingRestart(delayMs, `429限流退避 ${retryAfterSec}s`);
     }
 });
 
-// 健康检查：每60秒确认bot存活
+// 轮询成功即重置退避（通过 monkey-patch getUpdates 捕获成功）
+// node-telegram-bot-api 的 polling 内部调用 bot.getUpdates，成功时重置计数
+const _originalGetUpdates = bot.getUpdates.bind(bot);
+bot.getUpdates = function (...args) {
+    return _originalGetUpdates(...args).then(result => {
+        // 空轮询也算成功，重置窗口
+        pollingErrorCount = 0;
+        pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
+        pollingErrorTimestamps = [];
+        return result;
+    }).catch(err => { throw err; });
+};
+
+// 健康检查：独立计数，与轮询错误解耦
 const HEALTH_CHECK_INTERVAL = 60000;
+let healthErrorCount = 0;
+let lastHealthErrorLog = 0;
 setInterval(() => {
     bot.getMe().then(() => {
-        pollingErrorCount = 0;
+        healthErrorCount = 0;
+        // 健康检查成功也顺带重置轮询退避（说明网络已恢复）
+        pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
     }).catch(err => {
-        logWithTimestamp('error', '健康检查失败，bot可能已断开:', err.message);
-        pollingErrorCount++;
-        if (pollingErrorCount >= MAX_POLLING_ERRORS) {
+        const now = Date.now();
+        // 健康检查失败去重：5秒内不重复刷
+        if (now - lastHealthErrorLog < 5000) {
+            healthErrorCount++;
+        } else {
+            lastHealthErrorLog = now;
+            const is429 = isTooManyRequests(err);
+            if (is429) {
+                const retryAfterSec = parseRetryAfter(err) || 5;
+                logWithTimestamp('warn', `健康检查 429 限流，${retryAfterSec}s 后重试（多机同Token会导致此现象）`);
+                return; // 429 不计入健康错误，避免误重启
+            }
+            logWithTimestamp('error', `健康检查失败，bot可能已断开: ${err.message}`);
+            healthErrorCount++;
+        }
+        if (healthErrorCount >= MAX_POLLING_ERRORS) {
             logWithTimestamp('warn', '健康检查多次失败，正在重启轮询...');
-            pollingErrorCount = 0;
-            bot.stopPolling().then(() => {
-                bot.startPolling({ restart: true, clean: true });
-                logWithTimestamp('log', 'Telegram Bot轮询已重启（健康检查触发）');
-            }).catch(err => {
-                logWithTimestamp('error', '重启轮询失败:', err);
-            });
+            healthErrorCount = 0;
+            schedulePollingRestart(Math.min(pollingBackoffMs, 5000), '健康检查多次失败');
         }
     });
 }, HEALTH_CHECK_INTERVAL);
