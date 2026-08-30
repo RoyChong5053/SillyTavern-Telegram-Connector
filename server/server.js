@@ -530,6 +530,14 @@ async function handleTelegramCommand(command, args, chatId) {
             });
             return;
         }
+        // 回复超过5分钟则过期，防止推送过期内容
+        if (Date.now() - lastReply.ts > 5 * 60 * 1000) {
+            bot.sendMessage(chatId, '上一条回复已过期（超过5分钟），请重新发送消息。').catch(err => {
+                logWithTimestamp('error', `发送命令回复失败: ${err.message}`);
+            });
+            lastAiReplies.delete(chatId);
+            return;
+        }
         logWithTimestamp('log', `向 chatId ${chatId} 重推上一条AI回复 (${lastReply.text.length} 字符)`);
         await sendSplitMessage(chatId, lastReply.text);
         return;
@@ -780,6 +788,19 @@ if (data.type === 'stream_end' && data.chatId) {
     if (session.timer) {
       clearTimeout(session.timer);
     }
+    // 设置备用超时：若 final_message_update 永远不来，用 lastText 兜底
+    session.fallbackTimer = setTimeout(async () => {
+      logWithTimestamp('warn', `stream_end 后 10 秒未收到 final_message_update，用 lastText 兜底 ChatID ${data.chatId}`);
+      const fallbackText = session.lastText || "消息生成完成";
+      try {
+        await sendSplitMessage(data.chatId, fallbackText);
+        lastAiReplies.set(data.chatId, { text: fallbackText, ts: Date.now() });
+      } catch (err) {
+        logWithTimestamp('error', `兜底发送失败: ${err.message}`);
+      }
+      if (session.timer) clearTimeout(session.timer);
+      ongoingStreams.delete(data.chatId);
+    }, 10000);
     logWithTimestamp('log', `收到流式结束信号，等待最终渲染文本更新...`);
     // 注意：我们不在这里清理会话，而是等待 final_message_update
   }
@@ -802,6 +823,11 @@ if (data.type === 'final_message_update' && data.chatId) {
     // 清理超时定时器
     if (session.timeoutId) {
       clearTimeout(session.timeoutId);
+    }
+    // 清理 stream_end 设置的备用超时
+    if (session.fallbackTimer) {
+      clearTimeout(session.fallbackTimer);
+      session.fallbackTimer = null;
     }
     // 使用 await messagePromise
     let messageId;

@@ -98,6 +98,7 @@ function isRetryableError(errorMsg) {
         // 提供方请求超时 / 生成被中断：多为限流或 fallback 链较慢导致的瞬态问题
         'timed out', 'provider timed out', 'timeout',
         'aborted', 'abort',
+        'context canceled', 'canceled',
     ];
     // 永久错误：认证/配额问题，不应重试
     const permanentPatterns = [
@@ -212,11 +213,14 @@ function clearJobTimers(job) {
 }
 
 function finishJob(job) {
-    if (job && currentJob !== job) return;
-    clearJobTimers(currentJob);
-    currentJob = null;
-    processingMessage = false;
-    processQueue();
+    if (!job) return;
+    clearJobTimers(job);
+    job.finished = true;
+    if (currentJob === job) {
+        currentJob = null;
+        processingMessage = false;
+        processQueue();
+    }
 }
 
 function armActivityTimer(job) {
@@ -260,12 +264,12 @@ async function processMessageJob(job) {
         }
 
         // 1.5 若 SillyTavern 正在手动生成，等待其完成，避免并发 Generate 卡死 ST
-        //     上限 2 分钟，超过则判定卡死并自愈
-        const WAIT_ST_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+        //     上限 8 分钟，覆盖 reranker 慢速场景（弱CPU 3-5分钟），超过则判定卡死并自愈
+        const WAIT_ST_IDLE_TIMEOUT_MS = 8 * 60 * 1000;
         const waitStart = Date.now();
         while (isGenerating()) {
             if (Date.now() - waitStart > WAIT_ST_IDLE_TIMEOUT_MS) {
-                onJobWedged(job, '等待SillyTavern空闲超时(2分钟)');
+                onJobWedged(job, '等待SillyTavern空闲超时(8分钟)');
                 return;
             }
             await new Promise(r => setTimeout(r, 1000));
@@ -314,7 +318,6 @@ async function processMessageJob(job) {
 
         // 4. 定义一个清理函数（发送 stream_end；最终回复由 handleFinalMessage 负责）
         cleanup = () => {
-            if (currentJob !== job) return;
             if (job.cleanupDone) return;
             job.cleanupDone = true;
             eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, job.streamCallback);
@@ -334,9 +337,9 @@ async function processMessageJob(job) {
         armActivityTimer(job);
 
         // 7. 触发SillyTavern的生成流程，并用try...catch包裹
-        const MAX_RETRY_TIME_MS = 5 * 60 * 1000; // 5分钟
-        const MAX_RETRY_ATTEMPTS = 10; // 最大重试次数
-        const INITIAL_DELAY_MS = 3000; // 初始延迟3秒
+        const MAX_RETRY_TIME_MS = 8 * 60 * 1000; // 8分钟（覆盖 reranker 慢速场景）
+        const MAX_RETRY_ATTEMPTS = 3; // 最大重试次数（one-api 已稳定，无需多次重试）
+        const INITIAL_DELAY_MS = 5000; // 初始延迟5秒（给 one-api 更多 fallback 时间）
         const MAX_DELAY_MS = 30000; // 最大延迟30秒
         let generationSuccess = false;
         let lastError = null;
@@ -381,6 +384,11 @@ async function processMessageJob(job) {
 
                 // 智能错误分类：瞬态错误重试，永久错误立即失败
                 if (isRetryableError(errorMsg)) {
+                    // 如果已用时超过3分钟，说明瓶颈在本地管线（reranker慢速），重试只会再跑一次 reranker，无意义
+                    if ((Date.now() - startTime) > 3 * 60 * 1000) {
+                        console.log(`[Telegram Bridge] 已用时超过3分钟，判定为本地管线瓶颈（reranker），停止重试`);
+                        break;
+                    }
                     console.log(`[Telegram Bridge] 检测到瞬态错误，准备重试...`);
                     retryCount++;
 
@@ -530,6 +538,7 @@ function connect() {
                     chatId: data.chatId,
                     text: data.text,
                     inlineImage: data.inlineImage,
+                    finished: false,
                 });
                 processQueue();
                 return;
@@ -807,9 +816,15 @@ jQuery(async () => {
 
 // 全局事件监听器，用于最终消息更新
 function handleFinalMessage(lastMessageIdInChatArray) {
-    // 仅处理当前由 Telegram 触发的生成任务
     const job = currentJob;
     if (!job) {
+        console.warn('[Telegram Bridge] handleFinalMessage: no currentJob, skipping');
+        return;
+    }
+
+    // 如果该任务已经被其他路径完成，直接跳过
+    if (job.finished) {
+        console.warn('[Telegram Bridge] handleFinalMessage: job already finished, skipping');
         return;
     }
 
@@ -823,60 +838,74 @@ function handleFinalMessage(lastMessageIdInChatArray) {
     const chatId = job.chatId;
     const lastMessageIndex = lastMessageIdInChatArray - 1;
     if (lastMessageIndex < 0) {
+        console.warn(`[Telegram Bridge] lastMessageIndex < 0 (${lastMessageIdInChatArray}), finishJob`);
         finishJob(job);
         return;
     }
 
     setTimeout(() => {
-        // 仅当该任务仍处于进行中才处理（防止过期任务影响新任务）
-        if (currentJob !== job) return;
+        try {
+            // 仅当该任务仍处于进行中才处理（防止过期任务影响新任务）
+            if (currentJob !== job) {
+                console.warn(`[Telegram Bridge] handleFinalMessage setTimeout: currentJob !== job (${currentJob?.chatId} !== ${job.chatId}), skip`);
+                return;
+            }
 
-        const context = SillyTavern.getContext();
-        const lastMessage = context.chat[lastMessageIndex];
+            // 再次检查 job 是否已被其他路径完成
+            if (job.finished) {
+                console.warn('[Telegram Bridge] handleFinalMessage setTimeout: job already finished, skip');
+                return;
+            }
 
-        if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
-            const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
+            const context = SillyTavern.getContext();
+            const lastMessage = context.chat[lastMessageIndex];
 
-            if (messageElement.length > 0) {
-                const messageTextElement = messageElement.find('.mes_text');
+            if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
+                const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
 
-                let renderedText = messageTextElement.html()
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .replace(/<\/p>\s*<p>/gi, '\n\n')
+                if (messageElement.length > 0) {
+                    const messageTextElement = messageElement.find('.mes_text');
 
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = renderedText;
-                renderedText = tempDiv.textContent;
+                    let renderedText = messageTextElement.html()
+                        .replace(/<br\s*\/?>/gi, '\n')
+                        .replace(/<\/p>\s*<p>/gi, '\n\n');
 
-                console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${chatId}`);
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = renderedText;
+                    renderedText = tempDiv.textContent;
 
-                if (job.isStreamingMode) {
-                    ws.send(JSON.stringify({
-                        type: 'final_message_update',
-                        chatId: chatId,
-                        text: renderedText,
-                    }));
-                    job.isStreamingMode = false;
+                    console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${chatId}`);
+
+                    if (job.isStreamingMode) {
+                        ws.send(JSON.stringify({
+                            type: 'final_message_update',
+                            chatId: chatId,
+                            text: renderedText,
+                        }));
+                        job.isStreamingMode = false;
+                    } else {
+                        ws.send(JSON.stringify({
+                            type: 'ai_reply',
+                            chatId: chatId,
+                            text: renderedText,
+                        }));
+                    }
                 } else {
-                    ws.send(JSON.stringify({
-                        type: 'ai_reply',
-                        chatId: chatId,
-                        text: renderedText,
-                    }));
+                    console.warn(`[Telegram Bridge] 未找到消息DOM元素 mesid=${lastMessageIndex}，跳过推送（DOM可能尚未渲染完成）`);
                 }
             } else {
-                console.warn(`[Telegram Bridge] 未找到消息DOM元素 mesid=${lastMessageIndex}，跳过推送（DOM可能尚未渲染完成）`);
+                console.warn(`[Telegram Bridge] 最终消息校验未通过 mesid=${lastMessageIndex}`,
+                    lastMessage ? { is_user: !!lastMessage.is_user, is_system: !!lastMessage.is_system } : '消息对象不存在');
             }
-        } else {
-            console.warn(`[Telegram Bridge] 最终消息校验未通过 mesid=${lastMessageIndex}`,
-                lastMessage ? { is_user: !!lastMessage.is_user, is_system: !!lastMessage.is_system } : '消息对象不存在');
+        } catch (err) {
+            console.error(`[Telegram Bridge] handleFinalMessage setTimeout 内部异常:`, err);
+        } finally {
+            finishJob(job);
         }
-
-        finishJob(job);
     }, 100);
 }
 
-// 全局事件监听器，用于最终消息更新
+// 全局事件监听器，用于最终消息更新（使用 on 持续监听；job.finished 防重复触发）
 eventSource.on(event_types.GENERATION_ENDED, handleFinalMessage);
 
 // 添加对手动停止生成的处理
