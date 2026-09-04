@@ -1,5 +1,32 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-09-04 - Fallback 响应检测修复（one-api 多 channel 场景下回复丢失）
+
+### 背景
+用户 one-api 配置了十多个 fallback channel。当第一个 channel 超时/报错时，one-api 自动切换到备用 channel，ST 最终能拿到回复。但插件的 `Generate()` 在第一个 channel 失败时就抛出错误，重试逻辑立即重试，而 one-api fallback 链实际已送达的回复被忽略，导致 Telegram 端永远收不到消息。
+
+### 核心修复
+
+#### 1. Fallback 响应检测（index.js）
+- `Generate()` 抛出瞬态错误后，额外等待 5 秒（`FALLBACK_CHECK_DELAY_MS`）让 one-api fallback 链完成
+- 检查 ST chat 数组是否已收到 AI 回复（非 user/system 消息）
+- 若已收到：从 DOM 提取渲染文本，直接推送到 Telegram，跳过重试
+- 若未收到：继续正常重试流程
+
+#### 2. 增加重试次数（index.js）
+- `MAX_RETRY_ATTEMPTS` 从 3 提升至 5，给 one-api fallback 链更多尝试机会
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `index.js` | 新增 `FALLBACK_CHECK_DELAY_MS` 常量；`Generate()` 失败后等待并检查 ST chat 数组；`MAX_RETRY_ATTEMPTS` 3→5 |
+
+### 验证
+- `node --check index.js` 通过
+
+---
+
 ## 2026-08-07 - 稳定性优化 v5（Provider 超时重试 & 重发按钮精确化）
 
 ### 背景

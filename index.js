@@ -338,9 +338,10 @@ async function processMessageJob(job) {
 
         // 7. 触发SillyTavern的生成流程，并用try...catch包裹
         const MAX_RETRY_TIME_MS = 8 * 60 * 1000; // 8分钟（覆盖 reranker 慢速场景）
-        const MAX_RETRY_ATTEMPTS = 3; // 最大重试次数（one-api 已稳定，无需多次重试）
+        const MAX_RETRY_ATTEMPTS = 5; // 最大重试次数（给 one-api fallback 链更多机会）
         const INITIAL_DELAY_MS = 5000; // 初始延迟5秒（给 one-api 更多 fallback 时间）
         const MAX_DELAY_MS = 30000; // 最大延迟30秒
+        const FALLBACK_CHECK_DELAY_MS = 5000; // 等待 one-api fallback 完成的检测延迟
         let generationSuccess = false;
         let lastError = null;
         let retryCount = 0;
@@ -384,6 +385,44 @@ async function processMessageJob(job) {
 
                 // 智能错误分类：瞬态错误重试，永久错误立即失败
                 if (isRetryableError(errorMsg)) {
+                    // 等待 one-api fallback 链可能的后续响应
+                    console.log(`[Telegram Bridge] 等待 ${FALLBACK_CHECK_DELAY_MS / 1000}s 检查 one-api fallback 是否已送达...`);
+                    await new Promise(r => setTimeout(r, FALLBACK_CHECK_DELAY_MS));
+
+                    // 检查 ST 是否已通过 fallback 收到 AI 回复
+                    const contextAfterError = SillyTavern.getContext();
+                    const lastMsgIdx = contextAfterError.chat.length - 1;
+                    const lastMsg = contextAfterError.chat[lastMsgIdx];
+                    if (lastMsg && !lastMsg.is_user && !lastMsg.is_system) {
+                        // ST 已收到回复，尝试从 DOM 获取渲染后文本
+                        const messageElement = $(`#chat .mes[mesid="${lastMsgIdx}"]`);
+                        let renderedText = lastMsg.mes;
+                        if (messageElement.length > 0) {
+                            const messageTextElement = messageElement.find('.mes_text');
+                            if (messageTextElement.length > 0) {
+                                let html = messageTextElement.html()
+                                    .replace(/<br\s*\/?>/gi, '\n')
+                                    .replace(/<\/p>\s*<p>/gi, '\n\n');
+                                const tempDiv = document.createElement('div');
+                                tempDiv.innerHTML = html;
+                                renderedText = tempDiv.textContent;
+                            }
+                        }
+                        console.log(`[Telegram Bridge] Generate()报错但ST已通过 fallback 收到回复(${renderedText.length}字)，直接推送`);
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'ai_reply',
+                                chatId: job.chatId,
+                                text: renderedText,
+                            }));
+                        }
+                        job.error = false;
+                        cleanup();
+                        finishJob(job);
+                        return;
+                    }
+
+                    // 未收到 fallback 响应，继续重试逻辑
                     // 如果已用时超过3分钟，说明瓶颈在本地管线（reranker慢速），重试只会再跑一次 reranker，无意义
                     if ((Date.now() - startTime) > 3 * 60 * 1000) {
                         console.log(`[Telegram Bridge] 已用时超过3分钟，判定为本地管线瓶颈（reranker），停止重试`);
