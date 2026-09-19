@@ -278,18 +278,13 @@ function sendSplitMessage(chatId, text, extra = {}) {
             return sentMsg;
         }).catch(err => {
             logWithTimestamp('error', `发送分片消息 ${i + 1}/${chunks.length} 失败: ${err.message}`);
-            results.push({ success: false, index: i, error: err.message });
-            // 如果是连接错误（如ECONNRESET），抛出异常以便调用方知道发送失败
-            if (err.message && (err.message.includes('ECONNRESET') || err.message.includes('ETIMEDOUT') || 
-                err.message.includes('ENOTFOUND') || err.message.includes('network'))) {
-                throw new Error(`Telegram API连接错误: ${err.message}`);
-            }
             // 对于"消息未修改"等非致命错误，静默忽略
             if (err.message && err.message.includes('message is not modified')) {
                 results.push({ success: true, index: i });
                 return null;
             }
-            throw err;
+            results.push({ success: false, index: i, error: err.message });
+            return null; // 不再 throw，避免多分片并发时产生 unhandled rejection
         });
     });
     
@@ -300,9 +295,6 @@ function sendSplitMessage(chatId, text, extra = {}) {
             const failedChunks = results.filter(r => !r.success);
             throw new Error(`部分或全部分片消息发送失败: ${failedChunks.map(f => `chunk${f.index+1}(${f.error || 'unknown'})`).join(', ')}`);
         }
-    }).catch(err => {
-        logWithTimestamp('error', `sendSplitMessage 整体失败: ${err.message}`);
-        throw err; // 重新抛出错误，让调用方知道发送失败
     });
 }
 
@@ -1039,16 +1031,22 @@ function downloadPhoto(fileId) {
                 hostname: url.hostname,
                 path: url.pathname + url.search,
                 method: 'GET',
+                timeout: 30000, // 30秒超时
             };
 
             const chunks = [];
-            https.get(options, (res) => {
+            const req = https.get(options, (res) => {
                 res.on('data', chunk => chunks.push(chunk));
                 res.on('end', () => {
                     const buffer = Buffer.concat(chunks);
                     resolve(buffer);
                 });
-            }).on('error', reject);
+            });
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error('图片下载超时'));
+            });
+            req.on('error', reject);
         }).catch(reject);
     });
 }
@@ -1314,6 +1312,7 @@ setInterval(() => {
 
 // 监听Telegram消息
 bot.on('message', async (msg) => {
+try {
     const chatId = msg.chat.id;
     const text = msg.text;
     const userId = msg.from.id;
@@ -1374,10 +1373,14 @@ bot.on('message', async (msg) => {
         logWithTimestamp('warn', '收到Telegram消息，但SillyTavern扩展未连接。');
         bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
     }
+} catch (err) {
+    logWithTimestamp('error', '处理 Telegram 消息时发生未捕获异常:', err);
+}
 });
 
 // 处理回调查询（如重发按钮点击）
 bot.on('callback_query', async (query) => {
+try {
     const chatId = query.message.chat.id;
     const data = query.data;
 
@@ -1430,4 +1433,43 @@ bot.on('callback_query', async (query) => {
         // 使用过的token立即失效，避免重复重发
         if (entry) pendingResends.delete(token);
     }
+} catch (err) {
+    logWithTimestamp('error', '处理 Telegram 回调查询时发生未捕获异常:', err);
+}
 });
+
+// --- 全局错误处理器：防止未捕获异常直接杀掉进程 ---
+process.on('uncaughtException', (err) => {
+    logWithTimestamp('error', `[FATAL] 未捕获异常 (uncaughtException):`, err);
+    // 不退出进程，记录日志后继续运行
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logWithTimestamp('error', `[FATAL] 未处理的 Promise 拒绝 (unhandledRejection):`, reason);
+});
+
+// --- Map TTL 定期清理：防止内存泄漏 ---
+const MAP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 每5分钟清理一次
+const MAP_TTL_MS = 30 * 60 * 1000; // 30分钟过期
+
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [key, value] of lastMessages) {
+        if (value.ts && now - value.ts > MAP_TTL_MS) {
+            lastMessages.delete(key);
+            cleaned++;
+        }
+    }
+    for (const [key, value] of lastAiReplies) {
+        if (value.ts && now - value.ts > MAP_TTL_MS) {
+            lastAiReplies.delete(key);
+            cleaned++;
+        }
+    }
+
+    if (cleaned > 0) {
+        logWithTimestamp('log', `Map TTL清理: 已清理 ${cleaned} 条过期记录`);
+    }
+}, MAP_CLEANUP_INTERVAL_MS);
