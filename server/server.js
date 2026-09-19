@@ -270,12 +270,40 @@ function splitMessage(text, maxLength = MAX_TELEGRAM_LENGTH) {
 
 function sendSplitMessage(chatId, text, extra = {}) {
     const chunks = splitMessage(text);
+    // 记录发送结果，用于后续判断是否成功
+    const results = [];
     const promises = chunks.map((chunk, i) => {
-        return bot.sendMessage(chatId, chunk, i === 0 ? extra : {}).catch(err => {
+        return bot.sendMessage(chatId, chunk, i === 0 ? extra : {}).then(sentMsg => {
+            results.push({ success: true, index: i });
+            return sentMsg;
+        }).catch(err => {
             logWithTimestamp('error', `发送分片消息 ${i + 1}/${chunks.length} 失败: ${err.message}`);
+            results.push({ success: false, index: i, error: err.message });
+            // 如果是连接错误（如ECONNRESET），抛出异常以便调用方知道发送失败
+            if (err.message && (err.message.includes('ECONNRESET') || err.message.includes('ETIMEDOUT') || 
+                err.message.includes('ENOTFOUND') || err.message.includes('network'))) {
+                throw new Error(`Telegram API连接错误: ${err.message}`);
+            }
+            // 对于"消息未修改"等非致命错误，静默忽略
+            if (err.message && err.message.includes('message is not modified')) {
+                results.push({ success: true, index: i });
+                return null;
+            }
+            throw err;
         });
     });
-    return Promise.all(promises);
+    
+    return Promise.all(promises).then(() => {
+        // 检查是否所有分片都发送成功
+        const allSuccess = results.every(r => r.success);
+        if (!allSuccess) {
+            const failedChunks = results.filter(r => !r.success);
+            throw new Error(`部分或全部分片消息发送失败: ${failedChunks.map(f => `chunk${f.index+1}(${f.error || 'unknown'})`).join(', ')}`);
+        }
+    }).catch(err => {
+        logWithTimestamp('error', `sendSplitMessage 整体失败: ${err.message}`);
+        throw err; // 重新抛出错误，让调用方知道发送失败
+    });
 }
 
 // 重载服务器函数
@@ -539,7 +567,15 @@ async function handleTelegramCommand(command, args, chatId) {
             return;
         }
         logWithTimestamp('log', `向 chatId ${chatId} 重推上一条AI回复 (${lastReply.text.length} 字符)`);
-        await sendSplitMessage(chatId, lastReply.text);
+        try {
+            await sendSplitMessage(chatId, lastReply.text);
+            bot.sendMessage(chatId, '✅ 已成功重新推送上一条AI回复。').catch(e => {});
+        } catch (err) {
+            logWithTimestamp('error', `/repush 发送失败: ${err.message}`);
+            bot.sendMessage(chatId, `❌ 重推失败：当前Telegram服务暂不稳定（${err.message.includes('ECONNRESET') ? '连接已断开' : err.message}）。请稍后重试或检查网络。`).catch(e => {
+                logWithTimestamp('error', `发送错误消息失败: ${e.message}`);
+            });
+        }
         return;
     }
 
@@ -845,15 +881,22 @@ if (data.type === 'final_message_update' && data.chatId) {
     if (messageId) {
       logWithTimestamp('log', `收到流式最终渲染文本，更新消息 ${messageId}`);
       const finalText = data.text.slice(0, MAX_TELEGRAM_LENGTH);
-      await bot.editMessageText(finalText, {
-        chat_id: data.chatId,
-        message_id: messageId,
-      }).catch(err => {
-        if (!err.message.includes('message is not modified'))
-          logWithTimestamp('error', '编辑最终格式化 Telegram 消息失败:', err.message);
-      });
-      lastAiReplies.set(data.chatId, { text: finalText, ts: Date.now() });
-      logWithTimestamp('log', `ChatID ${data.chatId} 的流式传输准最终更新已发送。`);
+      try {
+        await bot.editMessageText(finalText, {
+          chat_id: data.chatId,
+          message_id: messageId,
+        }).catch(err => {
+          if (!err.message.includes('message is not modified'))
+            logWithTimestamp('error', '编辑最终格式化 Telegram 消息失败:', err.message);
+          throw err; // 重新抛出错误，除非是"未修改"
+        });
+        lastAiReplies.set(data.chatId, { text: finalText, ts: Date.now() });
+        logWithTimestamp('log', `ChatID ${data.chatId} 的流式传输准最终更新已发送。`);
+      } catch (err) {
+        if (!err.message || !err.message.includes('message is not modified')) {
+          logWithTimestamp('error', `编辑最终格式化 Telegram 消息失败，未保存至 lastAiReplies: ${err.message}`);
+        }
+      }
     } else {
       logWithTimestamp('warn', `收到 final_message_update，但流式会话的 messageId 未能获取。`);
     }
@@ -868,8 +911,13 @@ if (data.type === 'final_message_update' && data.chatId) {
   // 但为了健壮性，我们仍然保留这个处理
   else {
     logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
-    await sendSplitMessage(data.chatId, data.text);
-    lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
+    try {
+      await sendSplitMessage(data.chatId, data.text);
+      lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
+      logWithTimestamp('log', `非流式完整回复已发送并保存至 lastAiReplies。`);
+    } catch (err) {
+      logWithTimestamp('error', `非流式完整回复发送失败，未保存至 lastAiReplies: ${err.message}`);
+    }
   }
   return;
 }
@@ -889,7 +937,16 @@ if (data.type === 'final_message_update' && data.chatId) {
                         }
                     };
                 }
-                sendSplitMessage(data.chatId, data.text, replyMarkup);
+                try {
+                    await sendSplitMessage(data.chatId, data.text, replyMarkup);
+                    logWithTimestamp('log', `错误报告已发送给用户 ${data.chatId}。`);
+                } catch (err) {
+                    logWithTimestamp('error', `发送错误报告失败: ${err.message}`);
+                    // 即使发送失败，也向用户发送简单提示（如果连接恢复）
+                    try {
+                        bot.sendMessage(data.chatId, '抱歉，当前Telegram服务暂不稳定，您的消息已收到但回复未能送达。请稍后重试或尝试 /repush 命令。').catch(e => {});
+                    } catch (e) {}
+                }
             } else if (data.type === 'retry_status' && data.chatId) {
                 // 发送重试状态更新（可以编辑之前的状态消息，或发送新消息）
                 logWithTimestamp('log', `重试状态: 第${data.retryCount}次重试，已用时${data.elapsedTime}秒`);
@@ -902,8 +959,13 @@ if (data.type === 'final_message_update' && data.chatId) {
                     ongoingStreams.delete(data.chatId);
                 }
                 // 发送非流式回复（已内含分片处理）
-                await sendSplitMessage(data.chatId, data.text);
-                lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
+                try {
+                    await sendSplitMessage(data.chatId, data.text);
+                    lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
+                    logWithTimestamp('log', `非流式AI回复已发送并保存至 lastAiReplies。`);
+                } catch (err) {
+                    logWithTimestamp('error', `非流式AI回复发送失败，未保存至 lastAiReplies: ${err.message}`);
+                }
             } else if (data.type === 'typing_action' && data.chatId) {
                 logWithTimestamp('log', `显示"输入中"状态给Telegram用户 ${data.chatId}`);
                 bot.sendChatAction(data.chatId, 'typing').catch(error =>
@@ -1351,9 +1413,11 @@ bot.on('callback_query', async (query) => {
 
         // 检查SillyTavern是否连接
         if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-            bot.sendMessage(chatId, 'SillyTavern未连接，无法重发消息。').catch(err => {
+            try {
+                bot.sendMessage(chatId, '❌ SillyTavern未连接，无法重发消息。请确保SillyTavern已打开并启用了Telegram扩展。');
+            } catch (err) {
                 logWithTimestamp('error', '发送错误消息失败:', err.message);
-            });
+            }
             return;
         }
 
