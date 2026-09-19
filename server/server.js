@@ -116,6 +116,13 @@ if (token === 'TOKEN' || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
 const bot = new TelegramBot(token, { polling: false });
 logWithTimestamp('log', '正在初始化Telegram Bot...');
 
+// 安全的 fire-and-forget 发送，避免未捕获的 Promise rejection
+function sendMessageSafe(chatId, text, options) {
+    return bot.sendMessage(chatId, text, options).catch(err => {
+        logWithTimestamp('warn', `发送消息失败 (chatId ${chatId}): ${err.message}`);
+    });
+}
+
 // 手动清除所有未处理的消息，然后启动轮询
 (async function clearAndStartPolling() {
     try {
@@ -192,6 +199,11 @@ const heartbeatTimer = setInterval(() => {
 
 wss.on('close', () => {
     clearInterval(heartbeatTimer);
+});
+
+// 监听端口绑定等错误，避免 'error' 事件无监听器直接抛出导致进程崩溃
+wss.on('error', (error) => {
+    logWithTimestamp('error', `WebSocket服务器错误 (端口 ${wssPort}):`, error.message);
 });
 
 let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
@@ -277,14 +289,21 @@ function sendSplitMessage(chatId, text, extra = {}) {
             results.push({ success: true, index: i });
             return sentMsg;
         }).catch(err => {
-            logWithTimestamp('error', `发送分片消息 ${i + 1}/${chunks.length} 失败: ${err.message}`);
-            // 对于"消息未修改"等非致命错误，静默忽略
-            if (err.message && err.message.includes('message is not modified')) {
+            const msg = err.message || '';
+            // "消息未修改"等非致命错误，视为成功
+            if (msg.includes('message is not modified')) {
                 results.push({ success: true, index: i });
                 return null;
             }
-            results.push({ success: false, index: i, error: err.message });
-            return null; // 不再 throw，避免多分片并发时产生 unhandled rejection
+            // 网络瞬态错误降级为 warn
+            const isNetwork = msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('ENOTFOUND');
+            if (isNetwork) {
+                logWithTimestamp('warn', `发送分片消息 ${i + 1}/${chunks.length} 网络错误(将重试): ${msg}`);
+            } else {
+                logWithTimestamp('error', `发送分片消息 ${i + 1}/${chunks.length} 失败: ${msg}`);
+            }
+            results.push({ success: false, index: i, error: msg });
+            return null;
         });
     });
     
@@ -313,11 +332,11 @@ function reloadServer(chatId) {
         logWithTimestamp('log', '配置文件已重新加载');
     } catch (error) {
         logWithTimestamp('error', '重新加载配置文件时出错:', error);
-        if (chatId) bot.sendMessage(chatId, '重新加载配置文件时出错: ' + error.message);
+        if (chatId) sendMessageSafe(chatId, '重新加载配置文件时出错: ' + error.message);
         return;
     }
     logWithTimestamp('log', '服务器端组件已重载');
-    if (chatId) bot.sendMessage(chatId, '服务器端组件已成功重载。');
+    if (chatId) sendMessageSafe(chatId, '服务器端组件已成功重载。');
 }
 
 // 重启服务器函数
@@ -445,7 +464,7 @@ function handleSystemCommand(command, chatId) {
         const stStatus = sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN ?
             'SillyTavern状态：已连接 ✅' :
             'SillyTavern状态：未连接 ❌';
-        bot.sendMessage(chatId, `${bridgeStatus}\n${stStatus}`);
+        sendMessageSafe(chatId, `${bridgeStatus}\n${stStatus}`);
         return;
     }
 
@@ -459,7 +478,7 @@ function handleSystemCommand(command, chatId) {
                 sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
             } else {
                 // 如果未连接，直接重载服务器
-                bot.sendMessage(chatId, responseMessage);
+                sendMessageSafe(chatId, responseMessage);
                 reloadServer(chatId);
             }
             break;
@@ -471,7 +490,7 @@ function handleSystemCommand(command, chatId) {
                 sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
             } else {
                 // 如果未连接，直接重启服务器
-                bot.sendMessage(chatId, responseMessage);
+                sendMessageSafe(chatId, responseMessage);
                 restartServer(chatId);
             }
             break;
@@ -483,20 +502,20 @@ function handleSystemCommand(command, chatId) {
                 sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
             } else {
                 // 如果未连接，直接退出服务器
-                bot.sendMessage(chatId, responseMessage);
+                sendMessageSafe(chatId, responseMessage);
                 exitServer();
             }
             break;
         default:
             logWithTimestamp('warn', `未知的系统命令: ${command}`);
-            bot.sendMessage(chatId, `未知的系统命令: /${command}`);
+            sendMessageSafe(chatId, `未知的系统命令: /${command}`);
             return;
     }
 
     // 只有在SillyTavern已连接的情况下，消息才会在上面的switch语句中发送
     // 所以这里只在SillyTavern已连接时发送响应消息
     if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-        bot.sendMessage(chatId, responseMessage);
+        sendMessageSafe(chatId, responseMessage);
     }
 }
 
@@ -573,7 +592,7 @@ async function handleTelegramCommand(command, args, chatId) {
 
     // 检查SillyTavern是否连接
     if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-        bot.sendMessage(chatId, 'SillyTavern未连接，无法执行角色和聊天相关命令。请先确保SillyTavern已打开并启用了Telegram扩展。');
+        sendMessageSafe(chatId, 'SillyTavern未连接，无法执行角色和聊天相关命令。请先确保SillyTavern已打开并启用了Telegram扩展。');
         return;
     }
 
@@ -1119,7 +1138,7 @@ async function handlePhotoMessage(msg, chatId) {
             sillyTavernClient.send(payload);
         } else {
             logWithTimestamp('warn', '收到Telegram图片，但SillyTavern扩展未连接。');
-            bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+            sendMessageSafe(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
         }
     } catch (error) {
         logWithTimestamp('error', '处理图片消息时出错:', error);
@@ -1187,6 +1206,12 @@ function isTransientPollingError(error) {
         || msg.includes('econnreset') || msg.includes('etimedout') || msg.includes('fetch failed') || msg.includes('network');
 }
 
+// ECONNRESET 在 Telegram long-polling 中是正常的连接重置，无需计入错误窗口
+function isNormalPollingDisconnect(error) {
+    const msg = (error.message || '').toLowerCase();
+    return msg.includes('econnreset') || msg.includes('etimedout');
+}
+
 function schedulePollingRestart(delayMs, reason) {
     if (pollingRestartTimer) return; // 已有待执行的重启，避免叠加
     logWithTimestamp('warn', `将在 ${Math.round(delayMs / 1000)}s 后重启轮询（原因: ${reason}）`);
@@ -1212,6 +1237,16 @@ bot.on('polling_error', (error) => {
     const msg = error.message || String(error);
     const key = msg.slice(0, 80); // 去重 key：截断避免参数影响
     const is429 = isTooManyRequests(error);
+
+    // ECONNRESET/ETIMEDOUT 是 Telegram long-polling 正常的连接重置，库会自动重试
+    // 不计入错误窗口，不触发重启，仅以 info 级别记录
+    if (isNormalPollingDisconnect(error)) {
+        if (key !== lastPollingErrorLog.key || (now - lastPollingErrorLog.time) >= 30000) {
+            logWithTimestamp('log', `[polling] 轮询连接重置 (${msg.split('\n')[0]})，库自动重试中...`);
+            lastPollingErrorLog = { key, time: now };
+        }
+        return;
+    }
 
     // 去重刷屏：相同错误 5 秒内只打印一次详情，其余静默计数
     if (key === lastPollingErrorLog.key && (now - lastPollingErrorLog.time) < 5000) {
@@ -1242,7 +1277,7 @@ bot.on('polling_error', (error) => {
             : Math.min(pollingBackoffMs * 1.5 + Math.random() * 500, MAX_POLLING_BACKOFF_MS);
         pollingBackoffMs = backoff;
 
-        logWithTimestamp('error', `[polling_error] (${pollingErrorCount}/${MAX_POLLING_ERRORS} 窗口内${windowCount}次) ${msg} | 退避 ${Math.round(backoff)}ms`);
+        logWithTimestamp('warn', `[polling_error] (${pollingErrorCount}/${MAX_POLLING_ERRORS} 窗口内${windowCount}次) ${msg} | 退避 ${Math.round(backoff)}ms`);
 
         if (windowCount >= MAX_POLLING_ERRORS) {
             logWithTimestamp('warn', `轮询错误在 ${POLLING_ERROR_WINDOW_MS / 1000}s 窗口内已达 ${windowCount} 次，触发退避重启`);
@@ -1250,10 +1285,8 @@ bot.on('polling_error', (error) => {
             pollingErrorCount = 0;
             schedulePollingRestart(backoff, `窗口内${windowCount}次错误`);
         } else if (windowCount >= 3) {
-            // 3次以上就提前退避重启，避免等到5次刷屏
             schedulePollingRestart(backoff, `连续${windowCount}次瞬态错误`);
         }
-        // 1-2 次的瞬态错误（典型 WiFi 抖动 502）仅记录日志，不立即重启，靠库自身 300ms 重试自愈
     }
 
     // 若是 429 的被抑制分支，也需要按 retry_after 调度一次
@@ -1371,7 +1404,7 @@ try {
         sillyTavernClient.send(payload);
     } else {
         logWithTimestamp('warn', '收到Telegram消息，但SillyTavern扩展未连接。');
-        bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+        sendMessageSafe(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
     }
 } catch (err) {
     logWithTimestamp('error', '处理 Telegram 消息时发生未捕获异常:', err);
@@ -1416,11 +1449,8 @@ try {
 
         // 检查SillyTavern是否连接
         if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-            try {
-                bot.sendMessage(chatId, '❌ SillyTavern未连接，无法重发消息。请确保SillyTavern已打开并启用了Telegram扩展。');
-            } catch (err) {
-                logWithTimestamp('error', '发送错误消息失败:', err.message);
-            }
+            await bot.sendMessage(chatId, '❌ SillyTavern未连接，无法重发消息。请确保SillyTavern已打开并启用了Telegram扩展。')
+                .catch(err => logWithTimestamp('error', '发送错误消息失败:', err.message));
             return;
         }
 
@@ -1438,14 +1468,66 @@ try {
 }
 });
 
-// --- 全局错误处理器：防止未捕获异常直接杀掉进程 ---
+// --- 全局错误处理器 ---
+// uncaughtException：进程状态已不可信，不能继续运行（否则表现为"静默死亡"）
+// 策略：记录日志 → 尽力释放端口/停止轮询 → 拉起替代进程 → 退出。
+// 由 .restart_protection 防止无限重启。
+let _exiting = false;
+function spawnReplacementAndExit(reason) {
+    if (_exiting) return;
+    _exiting = true;
+
+    let spawned = false;
+    const doSpawn = () => {
+        if (spawned) return;
+        spawned = true;
+        try {
+            const { spawn } = require('child_process');
+            const serverPath = path.join(__dirname, 'server.js');
+            const cleanEnv = {
+                PATH: process.env.PATH,
+                NODE_PATH: process.env.NODE_PATH,
+                TELEGRAM_CLEAR_UPDATES: '1',
+            };
+            const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
+            child.unref();
+            logWithTimestamp('warn', `已拉起替代进程 (pid ${child.pid})，本进程即将退出（原因: ${reason}）`);
+        } catch (e) {
+            logWithTimestamp('error', '拉起替代进程失败，服务将停止:', e);
+        }
+        setTimeout(() => process.exit(1), 500);
+    };
+
+    // 尽力释放 2333 端口并停止轮询，避免替代进程 EADDRINUSE 或 Telegram 409
+    try {
+        bot.stopPolling({ cancel: true }).catch(() => {});
+    } catch (_) { /* ignore */ }
+
+    try {
+        if (wss) {
+            wss.close(() => {
+                logWithTimestamp('log', 'WebSocket服务器已关闭，准备退出');
+                doSpawn();
+            });
+        } else {
+            doSpawn();
+        }
+    } catch (_) {
+        doSpawn();
+    }
+    // 兜底：2 秒内端口未释放也强制拉起并退出
+    setTimeout(doSpawn, 2000);
+}
+
 process.on('uncaughtException', (err) => {
-    logWithTimestamp('error', `[FATAL] 未捕获异常 (uncaughtException):`, err);
-    // 不退出进程，记录日志后继续运行
+    logWithTimestamp('error', '[FATAL] 未捕获异常 (uncaughtException):', err);
+    spawnReplacementAndExit('uncaughtException');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    logWithTimestamp('error', `[FATAL] 未处理的 Promise 拒绝 (unhandledRejection):`, reason);
+// unhandledRejection：通常是某个 async 路径缺少 try/catch，记录日志但不退出
+// （Node.js 15+ 默认会 crash，这里覆盖为仅警告，保持服务可用）
+process.on('unhandledRejection', (reason) => {
+    logWithTimestamp('warn', `[UNHANDLED_REJECTION] 未处理的 Promise 拒绝（已忽略，不会退出进程）:`, reason);
 });
 
 // --- Map TTL 定期清理：防止内存泄漏 ---

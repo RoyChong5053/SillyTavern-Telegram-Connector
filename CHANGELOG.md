@@ -1,5 +1,42 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-09-19 - 进程稳定性修复（静默死亡 & ECONNRESET 日志噪音）
+
+### 背景
+插件偶发"静默死亡"：进程仍存活但 Telegram 端完全无响应；日志中持续出现大量
+`EFATAL: Error: read ECONNRESET`，看起来像致命错误，导致误判为网络故障。
+
+### 根因
+1. **ECONNRESET 属正常现象被当成致命错误**：Telegram long-polling 的连接被服务端重置时，
+   `node-telegram-bot-api` 会 emit `polling_error` 并在 `.finally()` 中自动重试（`telegramPolling.js:168`）。
+   原代码将其计入错误窗口、按 `error` 级别打印，制造大量噪音并可能触发不必要的轮询重启。
+2. **`uncaughtException` 吞掉异常后继续运行**：`server.js` 原先记录日志后不退出。
+   未捕获异常发生后进程状态已不可信，继续运行会导致 HTTP/WebSocket 状态损坏，
+   表现为"进程活着但功能死了"——即静默死亡。
+
+### 核心修复（server/server.js）
+- 新增 `isNormalPollingDisconnect()`：ECONNRESET/ETIMEDOUT 不再计入错误窗口、不触发重启，
+  仅在 30 秒去重后以 `log` 级别提示"库自动重试中"
+- `sendSplitMessage` 分片网络错误降级为 `warn`（非致命），并整理 `message is not modified` 判断顺序
+- `uncaughtException` 改为：记录日志 → 尽力释放 2333 端口/停止轮询 → 拉起替代进程 → 退出，
+  由 `.restart_protection` 防止无限重启（不再静默腐烂）
+- `unhandledRejection` 降级为 `warn`，不退出进程
+- `wss` 新增 `error` 监听器，避免端口绑定错误以无监听器的 `error` 事件抛出让进程崩溃
+- 新增 `sendMessageSafe()`，替换所有 fire-and-forget 的 `bot.sendMessage`，
+  消除未捕获的 Promise rejection；修复 `callback_query` 中用同步 `try/catch` 包异步
+  `bot.sendMessage`（该 catch 永远不会触发）的 bug
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `server/server.js` | ECONNRESET 降级；uncaughtException 自愈重启；wss error 监听；sendMessageSafe；callback_query 异步错误修复 |
+
+### 验证
+- `node --check server/server.js` 通过
+
+---
+
 ## 2026-09-04 - Fallback 响应检测修复（one-api 多 channel 场景下回复丢失）
 
 ### 背景
