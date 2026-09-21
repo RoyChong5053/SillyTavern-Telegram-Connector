@@ -113,7 +113,9 @@ if (token === 'TOKEN' || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
 }
 
 // 初始化Telegram Bot，但不立即启动轮询
-const bot = new TelegramBot(token, { polling: false });
+// request.timeout 作为兜底：getUpdates 长轮询(10s)若连接被静默丢弃，90s 内强制报错，
+// 让库的 .finally 得以执行并重排轮询，避免整个轮询循环永久悬挂。数值放宽以免误杀慢速图片上传。
+const bot = new TelegramBot(token, { polling: false, request: { timeout: 90000 } });
 logWithTimestamp('log', '正在初始化Telegram Bot...');
 
 // 安全的 fire-and-forget 发送，避免未捕获的 Promise rejection
@@ -1173,6 +1175,13 @@ let pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
 let pollingRestartTimer = null;
 let lastPollingErrorLog = { key: '', time: 0 };
 
+// 轮询存活看门狗状态：getUpdates 静默挂起时既不报错也不触发 polling_error，
+// 需要独立依据"距上次成功取回更新"的时间来判定并强制恢复。
+let lastPollSuccessAt = Date.now();
+let pollingRestartInFlight = false;
+const POLLING_STALL_MS = 40000;      // 超过此时长无成功 getUpdates 即判定为挂起
+const WATCHDOG_INTERVAL_MS = 15000;  // 看门狗检查间隔
+
 // 解析 Telegram 429 的 retry_after（秒）
 function parseRetryAfter(error) {
     try {
@@ -1212,23 +1221,32 @@ function isNormalPollingDisconnect(error) {
     return msg.includes('econnreset') || msg.includes('etimedout');
 }
 
+// 立即重启轮询：startPolling({restart:true}) 内部会 cancel 掉在途/悬挂的 getUpdates，
+// 这是唯一能从"getUpdates 永久 hang"中恢复的路径
+// （无参 bot.stopPolling() 会 await 那个悬挂请求，导致兜底重启一起卡死）。
+function doRestartPolling(reason) {
+    if (pollingRestartInFlight) return;
+    pollingRestartInFlight = true;
+    lastPollSuccessAt = Date.now(); // 重启期间打点，避免看门狗重复触发
+    bot.startPolling({ restart: true }).then(() => {
+        pollingRestartInFlight = false;
+        logWithTimestamp('log', `Telegram Bot轮询已重启（${reason}）`);
+    }).catch(err => {
+        pollingRestartInFlight = false;
+        logWithTimestamp('error', '重启轮询失败:', err && err.message ? err.message : err);
+        // 重启失败则退避重试
+        const nextDelay = Math.min(pollingBackoffMs * 2, MAX_POLLING_BACKOFF_MS);
+        pollingBackoffMs = nextDelay;
+        schedulePollingRestart(nextDelay, '重启失败退避重试');
+    });
+}
+
 function schedulePollingRestart(delayMs, reason) {
     if (pollingRestartTimer) return; // 已有待执行的重启，避免叠加
     logWithTimestamp('warn', `将在 ${Math.round(delayMs / 1000)}s 后重启轮询（原因: ${reason}）`);
     pollingRestartTimer = setTimeout(() => {
         pollingRestartTimer = null;
-        bot.stopPolling().then(() => {
-            // startPolling 内部会按 interval=300ms 恢复；restart:true 允许覆盖现有轮询
-            return bot.startPolling({ restart: true });
-        }).then(() => {
-            logWithTimestamp('log', `Telegram Bot轮询已重启（${reason}）`);
-        }).catch(err => {
-            logWithTimestamp('error', '重启轮询失败:', err && err.message ? err.message : err);
-            // 重启失败则退避重试
-            const nextDelay = Math.min(pollingBackoffMs * 2, MAX_POLLING_BACKOFF_MS);
-            pollingBackoffMs = nextDelay;
-            schedulePollingRestart(nextDelay, '重启失败退避重试');
-        });
+        doRestartPolling(reason);
     }, delayMs);
 }
 
@@ -1306,6 +1324,7 @@ bot.getUpdates = function (...args) {
         pollingErrorCount = 0;
         pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
         pollingErrorTimestamps = [];
+        lastPollSuccessAt = Date.now(); // 有成功取回即刷新存活时间
         return result;
     }).catch(err => { throw err; });
 };
@@ -1342,6 +1361,24 @@ setInterval(() => {
         }
     });
 }, HEALTH_CHECK_INTERVAL);
+
+// 轮询存活看门狗：getUpdates 静默挂起时既不 emit polling_error，健康检查(getMe 走新连接)
+// 也不会察觉，表现为"进程活着、日志空白、下一轮又自己好了"。
+// 这里独立监控"距上次成功取回更新"的时长，超时则强制 cancel 重启并留下日志。
+setInterval(() => {
+    if (pollingRestartInFlight) return;
+    if (!bot.isPolling()) {
+        logWithTimestamp('warn', '轮询看门狗：检测到轮询未在运行，正在重启...');
+        doRestartPolling('看门狗发现轮询未运行');
+        return;
+    }
+    const idleMs = Date.now() - lastPollSuccessAt;
+    if (idleMs > POLLING_STALL_MS) {
+        logWithTimestamp('warn', `轮询看门狗：已有 ${Math.round(idleMs / 1000)}s 未成功取回更新，判定为静默挂起，强制重启轮询...`);
+        if (pollingRestartTimer) { clearTimeout(pollingRestartTimer); pollingRestartTimer = null; }
+        doRestartPolling('看门狗检测到轮询静默挂起');
+    }
+}, WATCHDOG_INTERVAL_MS);
 
 // 监听Telegram消息
 bot.on('message', async (msg) => {

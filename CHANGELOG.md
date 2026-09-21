@@ -1,5 +1,42 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-09-22 - 轮询静默挂起自愈（超时兜底 + 存活看门狗 + 修复兜底死锁）
+
+### 背景
+插件再次偶发"静默不工作"：进程持续存活、日志**完全空白**，下一轮对话又自动恢复。
+排查确认既非进程崩溃（`038cb21` 已修）、也非多机同 Token（无 409 Conflict），而是
+`getUpdates` long-polling 请求**静默挂起**：请求发出后既不返回也不报错，导致
+`node-telegram-bot-api` 轮询循环的 `.finally()` 永不执行、循环停止重排，且不 emit
+`polling_error`，因此日志无任何输出；而健康检查 `getMe()` 走独立新连接仍然成功，
+无法察觉挂起。
+
+### 根因
+1. **无客户端请求超时**：`node-telegram-bot-api` 默认不设 HTTP 超时（`polling.params.timeout=10`
+   只是传给 Telegram 的长轮询等待秒数），连接被静默丢弃时会永久 hang。
+2. **无轮询存活监控**：健康检查只看 `getMe()`，不能反映 `getUpdates` 是否仍在推进。
+3. **兜底重启自身会卡死**：`schedulePollingRestart` 先调用无参 `bot.stopPolling()`，
+   它会 `await` 那个悬挂的 `getUpdates`（`telegramPolling.js:58-74`），导致重启永远不执行。
+
+### 核心修复（server/server.js）
+- Bot 初始化增加 `request: { timeout: 90000 }`，作为静默挂起的最终兜底（数值放宽以免误杀图片上传）
+- 新增轮询存活看门狗（15s 检查）：`getUpdates` 成功时刷新 `lastPollSuccessAt`，
+  超过 `POLLING_STALL_MS`（40s）无成功取回即判定挂起，打 `warn` 日志并强制重启
+- 新增 `doRestartPolling()`：改用 `bot.startPolling({ restart: true })`（内部 `cancel:true`），
+  可取消悬挂中的 `getUpdates`，解决无参 `stopPolling()` 的死锁
+- 看门狗同时检测 `!bot.isPolling()`，轮询意外停止也会被拉起
+- 加 `pollingRestartInFlight` 防重入，避免看门狗与调度器并发重启
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `server/server.js` | request 超时兜底；`lastPollSuccessAt` 存活打点；轮询存活看门狗；`doRestartPolling` 修复兜底死锁 |
+
+### 验证
+- `node --check server/server.js` 通过
+
+---
+
 ## 2026-09-19 - 进程稳定性修复（静默死亡 & ECONNRESET 日志噪音）
 
 ### 背景
