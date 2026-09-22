@@ -217,6 +217,56 @@ const ongoingStreams = new Map();
 // 用于存储每个聊天最后一条消息的内容（文本/图片），以便兼容旧格式按钮重发
 const lastMessages = new Map();
 
+// --- Telegram 更新去重：409/重启会导致同一 update 被重投，库的 offset 在 cancel 时可能未提交 ---
+// 无此去重时同一条用户消息会在同一秒内触发 10 次 bot.on('message')，进而让 ST 生成 10 次回复。
+// key: `${chatId}:${message_id}`，TTL 10 分钟，超量淘汰最旧。
+const seenTelegramMessages = new Map();
+const SEEN_MSG_TTL_MS = 10 * 60 * 1000;
+const MAX_SEEN_MSGS = 500;
+function isDuplicateTelegramMessage(chatId, messageId) {
+    if (messageId === undefined || messageId === null) return false;
+    const key = `${chatId}:${messageId}`;
+    const now = Date.now();
+    const prev = seenTelegramMessages.get(key);
+    if (prev && (now - prev) < SEEN_MSG_TTL_MS) return true;
+    seenTelegramMessages.set(key, now);
+    if (seenTelegramMessages.size > MAX_SEEN_MSGS) {
+        // Map 按插入顺序排列，删除最旧的一批
+        const overflow = seenTelegramMessages.size - MAX_SEEN_MSGS;
+        let n = 0;
+        for (const k of seenTelegramMessages.keys()) {
+            seenTelegramMessages.delete(k);
+            if (++n >= overflow) break;
+        }
+    }
+    // 顺带清理过期条目（低频触发即可）
+    if (seenTelegramMessages.size % 50 === 0) {
+        for (const [k, ts] of seenTelegramMessages) {
+            if (now - ts > SEEN_MSG_TTL_MS) seenTelegramMessages.delete(k);
+        }
+    }
+    return false;
+}
+
+// --- AI 回复幂等：同一 chatId 在短时间内收到完全相同的回复文本只送达一次 ---
+// 用于拦截“自己连续发同样的讯息”：ST 侧因重复 user_message 触发多次 ai_reply 时直接抑制。
+const recentAiSends = new Map();
+const AI_DEDUP_WINDOW_MS = 30000;
+function simpleHash(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+    return (h >>> 0).toString(36);
+}
+function isDuplicateAiReply(chatId, text) {
+    if (!text) return false;
+    const now = Date.now();
+    const fp = `${text.length}:${simpleHash(text.slice(0, 500))}`;
+    const prev = recentAiSends.get(chatId);
+    if (prev && prev.fp === fp && (now - prev.ts) < AI_DEDUP_WINDOW_MS) return true;
+    recentAiSends.set(chatId, { fp, ts: now });
+    return false;
+}
+
 // 用于存储每个聊天最近一条成功送达的AI回复全文，供 /repush 命令重新推送
 const lastAiReplies = new Map();
 
@@ -841,11 +891,15 @@ if (data.type === 'stream_end' && data.chatId) {
     session.fallbackTimer = setTimeout(async () => {
       logWithTimestamp('warn', `stream_end 后 10 秒未收到 final_message_update，用 lastText 兜底 ChatID ${data.chatId}`);
       const fallbackText = session.lastText || "消息生成完成";
-      try {
-        await sendSplitMessage(data.chatId, fallbackText);
-        lastAiReplies.set(data.chatId, { text: fallbackText, ts: Date.now() });
-      } catch (err) {
-        logWithTimestamp('error', `兜底发送失败: ${err.message}`);
+      if (isDuplicateAiReply(data.chatId, fallbackText)) {
+        logWithTimestamp('warn', `抑制重复的 stream_end 兜底推送 ChatID ${data.chatId}`);
+      } else {
+        try {
+          await sendSplitMessage(data.chatId, fallbackText);
+          lastAiReplies.set(data.chatId, { text: fallbackText, ts: Date.now() });
+        } catch (err) {
+          logWithTimestamp('error', `兜底发送失败: ${err.message}`);
+        }
       }
       if (session.timer) clearTimeout(session.timer);
       ongoingStreams.delete(data.chatId);
@@ -857,8 +911,14 @@ if (data.type === 'stream_end' && data.chatId) {
   // 可能是由于某些原因会话被提前清理了
   else {
     logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
-    // 为安全起见，我们仍然发送消息，但这种情况不应该发生
-    await sendSplitMessage(data.chatId, data.text || "消息生成完成");
+    // 幂等：异常路径的重复 stream_end 不重复落盘
+    const _t = data.text || "消息生成完成";
+    if (isDuplicateAiReply(data.chatId, _t)) {
+      logWithTimestamp('warn', `抑制重复的 stream_end 兜底推送 ChatID ${data.chatId}`);
+    } else {
+      // 为安全起见，我们仍然发送消息，但这种情况不应该发生
+      await sendSplitMessage(data.chatId, _t);
+    }
   }
   return;
 }
@@ -923,6 +983,10 @@ if (data.type === 'final_message_update' && data.chatId) {
   // 注意：这种情况不应该发生，因为我们已经在客户端修复了这个问题
   // 但为了健壮性，我们仍然保留这个处理
   else {
+    if (isDuplicateAiReply(data.chatId, data.text)) {
+      logWithTimestamp('warn', `抑制重复的非流式完整回复 ChatID ${data.chatId}（30s内相同文本）`);
+      return;
+    }
     logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
     try {
       await sendSplitMessage(data.chatId, data.text);
@@ -965,19 +1029,23 @@ if (data.type === 'final_message_update' && data.chatId) {
                 logWithTimestamp('log', `重试状态: 第${data.retryCount}次重试，已用时${data.elapsedTime}秒`);
                 // 可选：可以发送状态消息，但为避免刷屏，这里只记录日志
             } else if (data.type === 'ai_reply' && data.chatId) {
-                logWithTimestamp('log', `收到非流式AI回复，发送至Telegram用户 ${data.chatId}`);
-                // 确保在发送消息前清理可能存在的流式会话
-                if (ongoingStreams.has(data.chatId)) {
-                    logWithTimestamp('log', `清理 ChatID ${data.chatId} 的流式会话，因为收到了非流式回复`);
-                    ongoingStreams.delete(data.chatId);
-                }
-                // 发送非流式回复（已内含分片处理）
-                try {
-                    await sendSplitMessage(data.chatId, data.text);
-                    lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
-                    logWithTimestamp('log', `非流式AI回复已发送并保存至 lastAiReplies。`);
-                } catch (err) {
-                    logWithTimestamp('error', `非流式AI回复发送失败，未保存至 lastAiReplies: ${err.message}`);
+                if (isDuplicateAiReply(data.chatId, data.text)) {
+                    logWithTimestamp('warn', `抑制重复的非流式AI回复 ChatID ${data.chatId}（30s内相同文本，疑似重复投递）`);
+                } else {
+                    logWithTimestamp('log', `收到非流式AI回复，发送至Telegram用户 ${data.chatId}`);
+                    // 确保在发送消息前清理可能存在的流式会话
+                    if (ongoingStreams.has(data.chatId)) {
+                        logWithTimestamp('log', `清理 ChatID ${data.chatId} 的流式会话，因为收到了非流式回复`);
+                        ongoingStreams.delete(data.chatId);
+                    }
+                    // 发送非流式回复（已内含分片处理）
+                    try {
+                        await sendSplitMessage(data.chatId, data.text);
+                        lastAiReplies.set(data.chatId, { text: data.text, ts: Date.now() });
+                        logWithTimestamp('log', `非流式AI回复已发送并保存至 lastAiReplies。`);
+                    } catch (err) {
+                        logWithTimestamp('error', `非流式AI回复发送失败，未保存至 lastAiReplies: ${err.message}`);
+                    }
                 }
             } else if (data.type === 'typing_action' && data.chatId) {
                 logWithTimestamp('log', `显示"输入中"状态给Telegram用户 ${data.chatId}`);
@@ -1179,8 +1247,18 @@ let lastPollingErrorLog = { key: '', time: 0 };
 // 需要独立依据"距上次成功取回更新"的时间来判定并强制恢复。
 let lastPollSuccessAt = Date.now();
 let pollingRestartInFlight = false;
-const POLLING_STALL_MS = 40000;      // 超过此时长无成功 getUpdates 即判定为挂起
-const WATCHDOG_INTERVAL_MS = 15000;  // 看门狗检查间隔
+let lastRestartAt = 0;
+// 自激 409 熔断：doRestartPolling 会 cancel 在途 getUpdates，被 cancel 的旧连接
+// 必报一次 `409 Conflict: terminated by other getUpdates`，属预期现象，必须忽略，
+// 否则“重启→409→再重启”形成正反馈风暴（2026-09-22 线上每分钟几十次 409 即此因）。
+let ignore409Until = 0;
+let consecutive409Count = 0;
+let first409At = 0;
+let last409WarnAt = 0;
+const POLLING_STALL_MS = 150000;     // 空闲时 getUpdates 约每 10s 成功一次（含空数组）；150s 无成功才判挂起
+const WATCHDOG_INTERVAL_MS = 30000;  // 看门狗检查间隔
+const RESTART_COOLDOWN_MS = 60000;   // 任意重启后 60s 内看门狗不再开火
+const IGNORE_409_AFTER_RESTART_MS = 15000; // 重启后 15s 内的 409 视为自激，直接忽略
 
 // 解析 Telegram 429 的 retry_after（秒）
 function parseRetryAfter(error) {
@@ -1221,15 +1299,26 @@ function isNormalPollingDisconnect(error) {
     return msg.includes('econnreset') || msg.includes('etimedout');
 }
 
+function is409Conflict(error) {
+    const msg = (error && (error.message || String(error)) || '').toLowerCase();
+    return msg.includes('409') && (msg.includes('terminated by other') || msg.includes('conflict'));
+}
+
 // 立即重启轮询：startPolling({restart:true}) 内部会 cancel 掉在途/悬挂的 getUpdates，
 // 这是唯一能从"getUpdates 永久 hang"中恢复的路径
 // （无参 bot.stopPolling() 会 await 那个悬挂请求，导致兜底重启一起卡死）。
 function doRestartPolling(reason) {
     if (pollingRestartInFlight) return;
+    const now = Date.now();
+    // 全局节流：5s 内不重复重启，避免错误风暴叠加
+    if (now - lastRestartAt < 5000) return;
     pollingRestartInFlight = true;
+    lastRestartAt = now;
+    ignore409Until = now + IGNORE_409_AFTER_RESTART_MS; // 本次重启必然附带一次自激 409
     lastPollSuccessAt = Date.now(); // 重启期间打点，避免看门狗重复触发
     bot.startPolling({ restart: true }).then(() => {
         pollingRestartInFlight = false;
+        lastPollSuccessAt = Date.now();
         logWithTimestamp('log', `Telegram Bot轮询已重启（${reason}）`);
     }).catch(err => {
         pollingRestartInFlight = false;
@@ -1262,6 +1351,24 @@ bot.on('polling_error', (error) => {
         if (key !== lastPollingErrorLog.key || (now - lastPollingErrorLog.time) >= 30000) {
             logWithTimestamp('log', `[polling] 轮询连接重置 (${msg.split('\n')[0]})，库自动重试中...`);
             lastPollingErrorLog = { key, time: now };
+        }
+        return;
+    }
+
+    // 409 Conflict 单独处理：绝大多数是自激（restart:true cancel 旧连接必报一次），
+    // 必须先忽略重启后短窗口内的 409，否则形成“重启→409→再重启”风暴。
+    if (is409Conflict(error)) {
+        if (now < ignore409Until) return; // 自激 409，静默丢弃，不计数不重启
+        if (!first409At || (now - first409At) > 120000) { first409At = now; consecutive409Count = 0; }
+        consecutive409Count++;
+        // 30s 内只 warn 一次，避免刷屏
+        if (now - last409WarnAt >= 30000) {
+            last409WarnAt = now;
+            logWithTimestamp('warn', `[polling] 409 Conflict ×${consecutive409Count}（距首次 ${Math.round((now - first409At) / 1000)}s）：若持续超过 2 分钟请检查是否有第二台机器/旧进程在用同一 Token 轮询。单次 409 多为重启附带的旧连接被杀，属正常，已忽略。`);
+        }
+        // 真多机抢占才会持续 409：持续 2 分钟以上才退避重启一次，且最多 30s 一次
+        if ((now - first409At) > 120000 && !pollingRestartTimer && (now - lastRestartAt) > 30000) {
+            schedulePollingRestart(15000, '持续409疑似多实例抢占');
         }
         return;
     }
@@ -1324,6 +1431,7 @@ bot.getUpdates = function (...args) {
         pollingErrorCount = 0;
         pollingBackoffMs = BASE_POLLING_BACKOFF_MS;
         pollingErrorTimestamps = [];
+        consecutive409Count = 0; first409At = 0; // 任意一次成功即证明无多机抢占
         lastPollSuccessAt = Date.now(); // 有成功取回即刷新存活时间
         return result;
     }).catch(err => { throw err; });
@@ -1365,14 +1473,18 @@ setInterval(() => {
 // 轮询存活看门狗：getUpdates 静默挂起时既不 emit polling_error，健康检查(getMe 走新连接)
 // 也不会察觉，表现为"进程活着、日志空白、下一轮又自己好了"。
 // 这里独立监控"距上次成功取回更新"的时长，超时则强制 cancel 重启并留下日志。
+// 注意：退避等待/刚重启完的冷却期内不判挂起，避免与 polling_error 的退避重启叠加开火。
 setInterval(() => {
     if (pollingRestartInFlight) return;
+    const now = Date.now();
+    if (pollingRestartTimer) return; // 已在退避等待，让它先执行
+    if ((now - lastRestartAt) < RESTART_COOLDOWN_MS) return; // 重启冷却期
     if (!bot.isPolling()) {
         logWithTimestamp('warn', '轮询看门狗：检测到轮询未在运行，正在重启...');
         doRestartPolling('看门狗发现轮询未运行');
         return;
     }
-    const idleMs = Date.now() - lastPollSuccessAt;
+    const idleMs = now - lastPollSuccessAt;
     if (idleMs > POLLING_STALL_MS) {
         logWithTimestamp('warn', `轮询看门狗：已有 ${Math.round(idleMs / 1000)}s 未成功取回更新，判定为静默挂起，强制重启轮询...`);
         if (pollingRestartTimer) { clearTimeout(pollingRestartTimer); pollingRestartTimer = null; }
@@ -1387,6 +1499,12 @@ try {
     const text = msg.text;
     const userId = msg.from.id;
     const username = msg.from.username || 'N/A';
+
+    // 去重：409/重启重放会导致同一 message_id 在同秒内投递多次，先拦截
+    if (msg.message_id !== undefined && isDuplicateTelegramMessage(chatId, msg.message_id)) {
+        logWithTimestamp('warn', `丢弃重复投递的Telegram消息 chatId=${chatId} message_id=${msg.message_id}`);
+        return;
+    }
 
     // 检查白名单是否已配置且不为空
     if (config.allowedUserIds && config.allowedUserIds.length > 0) {

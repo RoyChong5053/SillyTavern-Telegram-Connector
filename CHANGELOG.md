@@ -1,5 +1,40 @@
 # Changelog - SillyTavern Telegram Connector
 
+## 2026-09-22 - 修复 3b93b0f 引入的自激 409 风暴 + 重复投递自发复读
+
+### 背景
+`3b93b0f` 上线后 `st-leer-tele` 出现新 bugs：`409 Conflict: terminated by other getUpdates`
+每分钟几十次；同一条用户消息同秒内重复投递 10 次（`10:21:49 "睡醒了…"`）；
+无用户输入却自发 `收到非流式AI回复 + 显示"输入中"` 循环推送同样讯息。
+`m64` 经查仅单进程 `node server.js`、无 crontab、无后台脚本，确认为单机自激而非多机抢占。
+
+### 根因
+1. **重启→409→再重启正反馈**：`doRestartPolling` 用 `startPolling({restart:true})` 必然
+   cancel 在途 `getUpdates`，被杀的旧连接必报一次 409；旧逻辑把该 409 计入错误窗口并
+   再次调度重启，`polling_error` + `schedulePollingRestart` + 看门狗三路并发开火。
+2. **看门狗误杀**：`POLLING_STALL_MS=40s` 过短且不感知退避等待/重启冷却期，干净空闲
+   启动（`10:29:08→10:30:08`）也会判挂起并叠加重启。
+3. **无去重**：`bot.on('message')` 无 `message_id` 去重，重放的 update 被 10x 转发给 ST；
+   WS 侧 `ai_reply / final_message_update / stream_end` 无幂等，ST 侧一次重复即 Telegram 连发。
+
+### 修复（server/server.js）
+- 新增 `is409Conflict` + `ignore409Until（重启后15s）`：自激 409 静默丢弃，不计数不重启；
+  409 持续 2 分钟以上才视为真多机抢占并 30s 至多重启一次，30s 合并 warn。
+- `getUpdates` 任意成功（含空数组）即清零 409 计数。
+- 看门狗放宽至 `150s/30s`，加 `60s 重启冷却` + `退避等待中不判挂起`；`doRestartPolling` 加
+  `5s 全局节流`；退避等待/重启期间刷新存活打点。
+- 新增 `seenTelegramMessages（chatId:message_id，10min TTL，上限500）`：重复投递直接丢弃并 warn。
+- 新增 `recentAiSends（同 chat 同文本 30s 去重）`：`ai_reply`、非流式 `final_message_update`、
+  `stream_end` 异常路径与兜底定时器重复推送直接抑制并 warn。
+- 修改文件：`server/server.js`（轮询/看门狗/去重/幂等）；`CHANGELOG.md`
+
+### 验证
+- `node --check server/server.js` 通过；`node --check index.js` 通过
+- 待部署验证：`git pull` 后单起 `node server.js`，空闲 5min 看门狗零误杀，409 归零，
+  手动发 1 条只收 1 条、无自发复读。
+
+---
+
 ## 2026-09-22 - 轮询静默挂起自愈（超时兜底 + 存活看门狗 + 修复兜底死锁）
 
 ### 背景
